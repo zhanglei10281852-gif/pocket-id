@@ -136,10 +136,10 @@ func TestMigrateSignupTokens(t *testing.T) {
 	require.NotContains(t, byToken, "EXPIREDTOKEN0003")
 
 	// The migration is idempotent: re-running it doesn't reset a token that has been used since
-	require.Equal(t, signupTokenConsumeOK, consumeSignupTokenForTest(t, svc.actorService, "TOKENNOGROUP0002").Status)
+	require.Equal(t, signupTokenConsumeOK, consumeSignupTokenForTest(t, svc.actorService, "TOKENNOGROUP0002", "migration-attempt-1").Status)
 	err = svc.migrateSignupTokens(t.Context())
 	require.NoError(t, err)
-	require.Equal(t, signupTokenConsumeLimitReached, consumeSignupTokenForTest(t, svc.actorService, "TOKENNOGROUP0002").Status)
+	require.Equal(t, signupTokenConsumeLimitReached, consumeSignupTokenForTest(t, svc.actorService, "TOKENNOGROUP0002", "migration-attempt-2").Status)
 }
 
 // TestLoadMigratedSignupTokensEmpty verifies that when there were no signup tokens, nothing is frozen and nothing is loaded.

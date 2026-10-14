@@ -20,8 +20,18 @@
 
 	let error: string | undefined = $state();
 
+	// One stable attempt ID per page visit, reused across retries of the same submission so a lost response never creates a second account
+	let signupAttemptId = $state(crypto.randomUUID());
+
 	async function handleSignup(userData: UserSignUp) {
-		const result = await tryCatch(userService.signup({ ...userData, token: data.token }));
+		// The attempt ID only matters for token signups, where the backend ties it to the token's quota slot
+		const result = await tryCatch(
+			userService.signup({
+				...userData,
+				token: data.token,
+				...(data.token ? { attemptId: signupAttemptId } : {})
+			})
+		);
 
 		if (result.error) {
 			error = getAxiosErrorMessage(result.error);

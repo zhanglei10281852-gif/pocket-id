@@ -27,4 +27,6 @@ export type UserSignUp = Omit<
 	'isAdmin' | 'disabled' | 'displayName' | 'emailVerified'
 > & {
 	token?: string;
+	// Stable identifier of one registration attempt, reused across retries so the backend never creates a duplicate account
+	attemptId?: string;
 };

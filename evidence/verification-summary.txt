@@ -1,0 +1,3 @@
+go test -count=1 -tags=exclude_frontend,unit ./... => PASS
+go test -count=5 -tags=exclude_frontend,unit ./internal/usersignup -run TestSignUpConcurrentSameAttemptCreatesOneUser|TestRecoverPendingAttempts|TestSignUpUnknownCommitOutcomeConfirmsUser|TestSignUpFailureReleasesOnlyOwnAttempt => PASS
+对抗交错：actor setState 已提交占位，随后 Dispatch 返回错误；重启扫描在 CreatedAt 未满两分钟时返回 deferred，启动扫描不重新 Dispatch，因此此尝试不存在后续释放触发。

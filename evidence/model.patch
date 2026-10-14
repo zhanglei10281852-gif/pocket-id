@@ -1,0 +1,2186 @@
+diff --git a/.trae/documents/signup_attempt_recovery_plan.md b/.trae/documents/signup_attempt_recovery_plan.md
+new file mode 100644
+index 00000000..6ead35e0
+--- /dev/null
++++ b/.trae/documents/signup_attempt_recovery_plan.md
+@@ -0,0 +1,124 @@
++# 注册令牌一次性占用与崩溃恢复 实施计划
++
++## 背景与现状研究
++
++注册流程位于 [service.go](file:///f:/swe/098834/project-02/backend/internal/usersignup/service.go)，令牌状态完全存放在 Francis actor 状态存储中（每个令牌一个 actor，actor ID = 令牌值，状态 TTL = 令牌有效期）。
++
++当前 `SignUp` 流程：
++1. 在 DB 事务外调用 actor `consume`：原子校验并把 `UsageCount++`；
++2. 开 DB 事务：`CreateUserInternal` → 签发 access token → 写审计日志 → `Commit` → 提交后 `ScheduleSync`；
++3. 任何错误都 best-effort 调用 actor `release`（**无参数盲目 `UsageCount--`**）。
++
++现存缺陷：
++- **占用没有尝试身份**：`release` 盲目递减，可能归还另一个并发注册占用的名额（limit=2 时 A、B 各占一次，A 失败 release 后 C 可再注册 → 超出限额）。
++- **占用后崩溃**：consume 成功后进程退出，名额永久被占，令牌"已用完"但没有用户。
++- **提交结果不确定**：`tx.Commit()` 返回错误但事务实际可能已提交，代码仍 release → 重试创建第二个账户。
++- **请求重放**：HTTP 重试没有关联身份，limit=1 时直接报 limit_reached，无法确认/复用已提交用户。
++- actor 不可用、令牌过期/删除、回滚/提交未知 没有可区分的诊断结果。
++
++关键事实（已核实）：
++- Francis v0.1.1 提供：状态 TTL、`Dispatch` 持久化任务（支持 `WithIdempotencyKey`、`WithJobDelay`、失败重试 + 死信 + `JobFailed` 回调，重启后继续投递）、actor 轮转锁串行化同一 actor 的所有 turn。参考 [backchannellogout/actor.go](file:///f:/swe/098834/project-02/backend/internal/backchannellogout/actor.go) 的持久任务模式。
++- [UserCreateDto.ID](file:///f:/swe/098834/project-02/backend/internal/dto/user_dto.go#L25-L38) 支持预选 UUID，`users` 主键约束可天然保证同一尝试至多一个用户。
++- 状态为 JSON 持久化；e2e 种子（[e2etest_service.go](file:///f:/swe/098834/project-02/backend/internal/service/e2etest_service.go#L592-L634)）和线上旧状态只含 `UsageCount` 标量，必须向后兼容。
++- 注册状态不经过 Pocket ID 自己的 SQL 迁移（actor 状态表归 Francis），**本改动无需新增 SQL 迁移**，不涉及 `TestDBSchemaParity`。
++
++## 设计方案
++
++### 1. 稳定的注册尝试身份
++
++- `signUpDto` 新增可选 `attemptId`（`omitempty,uuid`）。前端注册页加载时用 `crypto.randomUUID()` 生成一次，同一次提交的所有重试复用它；未携带时服务端在令牌路径上生成 UUID。
++- `attemptId` 同时作为新用户主键（`UserCreateDto.ID`），把"占用的名额"与"最终提交的 users 行"精确关联；DB 主键保证同一尝试至多一个用户。
++
++### 2. Actor 状态（向后兼容）
++
++```go
++type signupAttemptStatus string // pending | completed
++
++type signupTokenAttempt struct {
++    ID        string                // = attemptId = 未来用户 ID
++    Status    signupAttemptStatus
++    CreatedAt time.Time
++}
++
++type SignupTokenState struct {
++    ID, UserGroupIDs, CreatedAt, ExpiresAt // 不变
++    UsageLimit int
++    UsageCount int                        // 保留：权威的已占名额标量（旧状态/种子只有它）
++    Attempts   []signupTokenAttempt       // 新代码的逐次尝试台账（可为 nil=旧数据）
++}
++```
++
++不变量：`UsageCount` = 占用名额（pending + completed 都占位，与现有"consume 即计数"语义一致，管理列表/`0 of 8` 展示不变）。旧状态 `Attempts==nil` 时 N 个名额视为 N 个不可释放的遗留 completed 占用。
++
++### 3. Actor 方法（全部在同一 actor turn 锁内串行）
++
++- `consume`，请求 `{AttemptID}`：
++  - 不存在/过期 → `not_found`；`UsageCount >= UsageLimit` → `limit_reached`（维持外部 401）。
++  - 台账中已有该 AttemptID（pending 或 completed）→ 返回 `ok` + `Replayed=true`（不重复占位、不重复计数）。
++  - 否则追加 pending 尝试、`UsageCount++`、保存状态，并 `Dispatch(WithJobDelay(约 2 分钟), WithIdempotencyKey(AttemptID))` 一个持久对账任务；重放分支也 Dispatch（幂等合并，自愈"状态已写但任务丢失"）。
++- `complete` `{AttemptID}`：pending→completed，名额不动；尝试不存在而状态还在（对账已释放但提交晚到）则补记 completed 并 `UsageCount++`（保住已提交用户的名额）并告警；completed 再调为 no-op。**completed 永不被释放。**
++- `release` `{AttemptID}`：仅当该 ID 的尝试存在且为 pending 时移除并 `UsageCount--`；completed/不存在 → no-op。因此绝不会递减别的并发注册。
++- `reconcile` `{AttemptID, UserExists}`，返回动作 `completed | released | deferred | noop`：
++  - pending + 用户已存在 → completed；
++  - pending + 用户不存在且尝试年龄 < 宽限期 → `deferred`（不动名额，等待重试）；
++  - pending + 用户不存在且超过宽限期 → released（仅移除本尝试并 `UsageCount--`）；
++  - 非 pending/无状态 → noop。
++- `create`/`migrate`/`delete` 保持原行为。
++- 新增 `Job`（方法名 `reconcile-attempt`）：负载 `{AttemptID}`，经注入的 reconciler 查 DB：用户存在→complete 并回调 `AttemptConfirmed`（补排 SCIM）；不存在→reconcile，`deferred` 或 DB 查询出错时返回普通错误让框架重试；永久坏数据返回 `ErrJobPermanentFailure`。`JobFailed` 记录含令牌/尝试 ID 的诊断日志（安全方向：名额保持占用）。
++- actor 注册加 `local.WithMaxAttempts(5)`，其余默认。
++
++### 4. Service.SignUp 新流程（令牌路径）
++
++1. 开放注册门槛判断不变。
++2. 解析/生成 `attemptId`；调用 actor `consume {AttemptID}`：
++   - `ErrNoHost/ErrActorHalted/ErrActorNotHosted/context 超时` 等 → 新增 `apperror.SignupTemporarilyUnavailable()`（HTTP 503，code `signup_temporarily_unavailable`，提示稍后用同一请求重试；不做任何补偿）；其余 invoke 错误 → 500。
++   - `not_found`（过期/删除）、`limit_reached` → 维持 `TokenInvalidOrExpired` 401（内部状态仍可区分，日志可诊断）。
++3. 按主键查用户 `id=attemptId`：
++   - **已存在（重放/恢复）**：best-effort `complete`，为已有用户**重新签发** access token（审计已随首个事务写入，不重复写；SCIM 用幂等的 `ScheduleSync` 补排），返回该用户。不创建账户。
++4. 不存在 → 事务内用固定 `attemptId` 创建用户（默认组、custom claims 顺序不变）、签发 token、写审计、提交。
++5. 事务后结果处理：
++   - 成功确认 → best-effort `complete`，然后 `ScheduleSync`（维持原有"提交后单次调度"顺序）。
++   - **任何错误**（含 profile 冲突、提交失败）→ 统一对账（不做盲目 release）：用新连接查 `id=attemptId`：
++     - 用户存在（含不确定提交实际成功、并发同 ID 竞争落败）→ `complete` + `ScheduleSync` + 重签 token，按成功返回；
++     - 用户不存在 → `release{AttemptID}`（只归还本尝试名额），返回原始错误；
++     - 查询本身出错 → 不归还，返回错误，持久对账任务兜底。
++   - complete/release 调用失败仅记日志：持久对账任务（及启动扫描）是兜底。
++6. 开放注册（无令牌）与 `SignUpInitialAdmin` 路径完全不改（不固定 ID、不调 actor）。
++
++### 5. 重启恢复（启动扫描）
++
++在现有 `RunSignupTokenMigration`（host ready 后执行、阻塞至 ctx 取消）中，迁移之后追加 `recoverPendingAttempts(ctx)`：
++- `ListStates` 分页枚举所有令牌状态，对每个 pending 尝试批量查 DB 用户是否存在，再调 actor `reconcile`；
++- `deferred`（年轻尝试，另一实例可能正在处理或刚重启）跳过，留给延迟任务；
++- 用户存在→completed（补排 SCIM），超过宽限期且无用户→released。
++- 覆盖"状态已写、Dispatch 丢失/进程立即被杀"的缺口；与持久任务互为幂等兜底。
++- 宽限期（2 分钟）远大于正常请求时长，崩溃场景无存活事务，释放判定安全。
++- 令牌过期后状态随 TTL 清除：过期令牌不可再注册，名额无需归还；已提交用户仍在库中（可正常登录/管理），不产生重复。
++
++## 变更文件
++
++- [models.go](file:///f:/swe/098834/project-02/backend/internal/usersignup/models.go)：`signupTokenAttempt`、状态枚举、状态新增 `Attempts`。
++- [actor.go](file:///f:/swe/098834/project-02/backend/internal/usersignup/actor.go)：consume/complete/release/reconcile 协议、Job/JobFailed、Dispatch；注入 reconciler。
++- [dto.go](file:///f:/swe/098834/project-02/backend/internal/usersignup/dto.go)：`signUpDto.AttemptID`。
++- [service.go](file:///f:/swe/098834/project-02/backend/internal/usersignup/service.go)：幂等注册流程、错误后按主键对账、`recoverPendingAttempts`、reconciler 实现（`UserExistsForAttempt`/`AttemptConfirmed`）。
++- [module.go](file="file:///f:/swe/098834/project-02/backend/internal/usersignup/module.go")：工厂闭包注入 service（仿 backchannellogout）、`WithMaxAttempts`、启动时运行扫描。
++- [error.go](file:///f:/swe/098834/project-02/backend/internal/apperror/error.go) 与 [constructors.go](file:///f:/swe/098834/project-02/backend/internal/apperror/constructors.go)：新增 `CodeSignupTemporarilyUnavailable` + 构造器。
++- 测试：更新 `actor_test.go`（release 带 AttemptID 等）、`service_test.go`（现有补偿测试适配），新增：逐尝试释放不串名额、重放幂等（同 ID 至多一用户并返回已有用户）、提交不确定恢复、reconcile 三态与宽限、启动扫描、并发同 ID、503 分类。
++- 前端：`user.type.ts` 加 `attemptId?`；[signup/+page.svelte](file:///f:/swe/098834/project-02/frontend/src/routes/signup/+page.svelte) 每页生成一个稳定 UUID 随请求发送（无 attemptId 的旧客户端行为不变）。
++- e2e 种子无需改动（`UsageCount` 标量语义保留，fullyUsed 种子仍 limit_reached）。
++
++## 验证
++
++1. `cd backend && go test -tags=exclude_frontend,unit ./internal/usersignup/... ./internal/apperror/...`
++2. `go test -tags=exclude_frontend,unit ./...` 全量；`golangci-lint run`。
++3. `pnpm check`（前端类型门）、`pnpm lint`、`pnpm format`。
++4. 重点人工核对：事务期间零 actor 调用（SQLite 死锁约束保持）；审计只在事务内写一次；SCIM 仅提交确认后调度；初始管理员、开放注册、令牌列表/撤销接口签名不变。
++5. 可选：`tests/setup` docker compose + Playwright `user-signup.spec.ts`（需要 Docker，环境允许时）。
++
++## 风险与处理
++
++- **晚提交竞争**（对账释放后原事务才提交）：complete 检测到尝试缺失会补记 completed 并恢复计数（可能触顶限额，记告警日志）；用户已存在是不可撤销事实，绝不重复建人。
++- **任务/状态两次存储非原子**：consume 重放分支重复 Dispatch（幂等键去重）+ 启动扫描双兜底。
++- **旧状态兼容**：保留 `UsageCount`，新字段为可选切片；迁移测试断言的 `UsageCount` 不受影响。
++- **宽限期内活跃请求被误判**：2 分钟延迟 + 框架重试 + 启动扫描跳过年轻尝试；崩溃场景无并发存活事务。
++- **503 文案**：由后端消息返回，前端既有错误展示组件直接呈现，不改 i18n 文件。
+diff --git a/backend/internal/apperror/constructors.go b/backend/internal/apperror/constructors.go
+index c621265f..44c37b52 100644
+--- a/backend/internal/apperror/constructors.go
++++ b/backend/internal/apperror/constructors.go
+@@ -260,6 +260,10 @@ func OpenSignupDisabled() *Error {
+ 	return New(CodeOpenSignupDisabled, http.StatusForbidden, "Open user signup is not enabled")
+ }
+ 
++func SignupTemporarilyUnavailable() *Error {
++	return New(CodeSignupTemporarilyUnavailable, http.StatusServiceUnavailable, "Signup is temporarily unavailable, please try again")
++}
++
+ func ClientIDAlreadyExists() *Error {
+ 	return New(CodeClientIDAlreadyExists, http.StatusConflict, "Client ID is already in use")
+ }
+diff --git a/backend/internal/apperror/error.go b/backend/internal/apperror/error.go
+index 26ea71ac..731ae490 100644
+--- a/backend/internal/apperror/error.go
++++ b/backend/internal/apperror/error.go
+@@ -70,6 +70,7 @@ const (
+ 	CodeLogoPresetsDisabled             Code = "logo_presets_disabled"
+ 	CodeLogoPresetsUnavailable          Code = "logo_presets_unavailable"
+ 	CodeOidcPARRequired                 Code = "oidc_par_required"
++	CodeSignupTemporarilyUnavailable     Code = "signup_temporarily_unavailable"
+ )
+ 
+ // FieldError describes one safe, client-actionable validation failure
+diff --git a/backend/internal/usersignup/actor.go b/backend/internal/usersignup/actor.go
+index 68ba1b45..6fc4804d 100644
+--- a/backend/internal/usersignup/actor.go
++++ b/backend/internal/usersignup/actor.go
+@@ -20,18 +20,30 @@ import (
+ // SignupTokenActorType is the actor type for the signup token actor
+ const SignupTokenActorType = "SignupToken"
+ 
++const (
++	// attemptReconcileDelay is how long a consumed attempt may stay pending before automatic reconciliation assumes the request is gone.
++	// It must be much longer than a signup request can take, so a still-running request is never reconciled out from under itself.
++	attemptReconcileDelay = 2 * time.Minute
++	// attemptReconcileMaxAttempts caps the retries of one reconciliation job, matching the delivery job pattern
++	attemptReconcileMaxAttempts = 5
++)
++
+ // Methods exposed by the signup token actor
+-// Because we cannot invoke an actor while a DB transaction is open (that would deadlock on SQLite), consuming a token is done by invoking the actor first (which atomically validates it and increments its usage count), and only afterwards performing the remaining work.
+-// On failure, the caller compensates by releasing the token via the "release" method as best-effort.
++// Because we cannot invoke an actor while a DB transaction is open (that would deadlock on SQLite), consuming a token is done by invoking the actor first (which atomically validates it and reserves one quota slot for a stable attempt), and only afterwards performing the remaining work.
++// Every accepted consume carries a stable attempt ID: failures release only that attempt's slot, and reconciliation after a crash ties the attempt to the committed user.
+ const (
+ 	// SignupTokenMethodCreate stores a new signup token, replacing any existing state
+ 	SignupTokenMethodCreate = "create"
+ 	// SignupTokenMethodDelete removes a signup token
+ 	SignupTokenMethodDelete = "delete"
+ 
+-	signupTokenMethodMigrate = "migrate"
+-	signupTokenMethodConsume = "consume"
+-	signupTokenMethodRelease = "release"
++	signupTokenMethodMigrate   = "migrate"
++	signupTokenMethodConsume   = "consume"
++	signupTokenMethodComplete  = "complete"
++	signupTokenMethodRelease   = "release"
++	signupTokenMethodReconcile = "reconcile"
++	// signupTokenJobReconcile is the durable job method that reconciles one pending attempt after the grace delay
++	signupTokenJobReconcile = "reconcile-attempt"
+ )
+ 
+ // signupTokenConsumeStatus is the outcome of a "consume" invocation.
+@@ -46,8 +58,24 @@ const (
+ 	signupTokenConsumeLimitReached signupTokenConsumeStatus = "limit_reached"
+ )
+ 
++// signupTokenReconcileStatus is the outcome of a "reconcile" invocation.
++type signupTokenReconcileStatus string
++
++const (
++	// signupTokenReconcileCompleted means the pending attempt was confirmed against an existing user and marked completed
++	signupTokenReconcileCompleted signupTokenReconcileStatus = "completed"
++	// signupTokenReconcileReleased means the pending attempt was abandoned without a user and its slot was released
++	signupTokenReconcileReleased signupTokenReconcileStatus = "released"
++	// signupTokenReconcileDeferred means the attempt is still within the grace window, so no decision was made
++	signupTokenReconcileDeferred signupTokenReconcileStatus = "deferred"
++	// signupTokenReconcileNoop means there was nothing to reconcile (unknown or already completed attempt, deleted token)
++	signupTokenReconcileNoop signupTokenReconcileStatus = "noop"
++)
++
+ // SignupTokenState is the persisted state of a signup token actor.
+ // The token value itself is the actor's ID, so it isn't repeated here.
++// UsageCount stays the authoritative occupied-slot counter, so states written by older versions (which have no attempts) keep their accounting.
++// Attempts is the per-use ledger that makes releasing and crash recovery precise.
+ type SignupTokenState struct {
+ 	ID           string
+ 	UsageLimit   int
+@@ -55,6 +83,24 @@ type SignupTokenState struct {
+ 	UserGroupIDs []string
+ 	CreatedAt    time.Time
+ 	ExpiresAt    time.Time
++	Attempts     []signupTokenAttempt
++}
++
++// signupTokenConsumeRequest is the payload of the "consume" method
++type signupTokenConsumeRequest struct {
++	// AttemptID is the stable identifier of this registration attempt, and doubles as the ID of the user that will be created
++	AttemptID string
++}
++
++// signupTokenAttemptRequest references one attempt by its ID
++type signupTokenAttemptRequest struct {
++	AttemptID string
++}
++
++// signupTokenReconcileRequest carries the database lookup result for a pending attempt
++type signupTokenReconcileRequest struct {
++	AttemptID  string
++	UserExists bool
+ }
+ 
+ // signupTokenConsumeResponse is the response of the "consume" method
+@@ -62,23 +108,49 @@ type signupTokenConsumeResponse struct {
+ 	Status signupTokenConsumeStatus
+ 	// UserGroupIDs is set only when Status is "ok", and contains the groups the new user should join
+ 	UserGroupIDs []string
++	// Replayed is true when an existing attempt with the same ID was returned instead of occupying a new slot
++	Replayed bool
++}
++
++// signupTokenReconcileResponse is the response of the "reconcile" method
++type signupTokenReconcileResponse struct {
++	Status signupTokenReconcileStatus
++}
++
++// AttemptReconciler lets the actor inspect the database while reconciling an attempt.
++// It's implemented by the usersignup Service, which owns the database handle.
++type AttemptReconciler interface {
++	// UserExistsForAttempt reports whether the user tied to the attempt ID has been committed
++	UserExistsForAttempt(ctx context.Context, attemptID string) (bool, error)
++	// AttemptConfirmed is called after a pending attempt was confirmed against an existing user, so post-commit side effects a crashed request may have missed can be restored
++	AttemptConfirmed(ctx context.Context, attemptID string)
+ }
+ 
+ // signupTokenActor is the actor that manages a single signup token
+ type signupTokenActor struct {
+-	log    *slog.Logger
+-	client actor.Client[SignupTokenState]
++	actorID    string
++	log        *slog.Logger
++	client     actor.Client[SignupTokenState]
++	reconciler AttemptReconciler
+ }
+ 
+-// NewSignupTokenActor allocates a new signup token actor
+-// It satisfies actor.Factory
++// NewSignupTokenActor allocates a new signup token actor without database recovery support.
++// It satisfies actor.Factory and is kept for tests; production wires the reconciler through NewSignupTokenActorWithReconciler.
+ func NewSignupTokenActor(actorID string, service *actor.Service) actor.Actor {
++	return NewSignupTokenActorWithReconciler(actorID, service, nil)
++}
++
++// NewSignupTokenActorWithReconciler allocates a new signup token actor with the database accessor used by recovery jobs
++func NewSignupTokenActorWithReconciler(actorID string, service *actor.Service, reconciler AttemptReconciler) actor.Actor {
+ 	return &signupTokenActor{
++		actorID: actorID,
+ 		log: slog.With(
+ 			slog.String("scope", "actor"),
+ 			slog.String("actorType", SignupTokenActorType),
++			slog.String("token", actorID),
+ 		),
+-		client: actor.NewActorClient[SignupTokenState](SignupTokenActorType, actorID, service),
++		client:     actor.NewActorClient[SignupTokenState](SignupTokenActorType, actorID, service),
++		reconciler: reconciler,
+ 	}
+ }
+ 
+@@ -90,9 +162,13 @@ func (a *signupTokenActor) Invoke(parentCtx context.Context, method string, data
+ 	case signupTokenMethodMigrate:
+ 		return nil, a.create(parentCtx, data, true)
+ 	case signupTokenMethodConsume:
+-		return a.consume(parentCtx)
++		return a.consume(parentCtx, data)
++	case signupTokenMethodComplete:
++		return nil, a.complete(parentCtx, data)
+ 	case signupTokenMethodRelease:
+-		return nil, a.release(parentCtx)
++		return nil, a.release(parentCtx, data)
++	case signupTokenMethodReconcile:
++		return a.reconcile(parentCtx, data)
+ 	case SignupTokenMethodDelete:
+ 		return nil, a.delete(parentCtx)
+ 	default:
+@@ -130,8 +206,21 @@ func (a *signupTokenActor) create(parentCtx context.Context, data actor.Envelope
+ 	return a.setState(parentCtx, state)
+ }
+ 
+-// consume atomically validates the token and, if it's still usable, records one more use.
+-func (a *signupTokenActor) consume(parentCtx context.Context) (signupTokenConsumeResponse, error) {
++// consume atomically validates the token and reserves one quota slot bound to the request's attempt ID.
++// A repeated consume with the same attempt ID returns the existing attempt without occupying another slot.
++func (a *signupTokenActor) consume(parentCtx context.Context, data actor.Envelope) (signupTokenConsumeResponse, error) {
++	var req signupTokenConsumeRequest
++	if data == nil {
++		return signupTokenConsumeResponse{}, fmt.Errorf("request body is empty for method '%s'", signupTokenMethodConsume)
++	}
++	err := data.Decode(&req)
++	if err != nil {
++		return signupTokenConsumeResponse{}, fmt.Errorf("request body is not valid for method '%s': %w", signupTokenMethodConsume, err)
++	}
++	if req.AttemptID == "" {
++		return signupTokenConsumeResponse{}, fmt.Errorf("request for method '%s' is missing the attempt ID", signupTokenMethodConsume)
++	}
++
+ 	ctx, cancel := context.WithTimeout(parentCtx, 10*time.Second)
+ 	defer cancel()
+ 	state, err := a.client.GetState(ctx)
+@@ -146,27 +235,104 @@ func (a *signupTokenActor) consume(parentCtx context.Context) (signupTokenConsum
+ 		}, nil
+ 	}
+ 
++	// A replay of an accepted attempt is idempotent, whether the attempt is still pending or already completed
++	if attempt := findSignupAttempt(state.Attempts, req.AttemptID); attempt != nil {
++		if attempt.Status == signupAttemptPending {
++			// Re-arm reconciliation in case the previous scheduling was lost with the process
++			err = a.scheduleReconciliation(parentCtx, req.AttemptID)
++			if err != nil {
++				return signupTokenConsumeResponse{}, err
++			}
++		}
++
++		return signupTokenConsumeResponse{
++			Status:       signupTokenConsumeOK,
++			UserGroupIDs: state.UserGroupIDs,
++			Replayed:     true,
++		}, nil
++	}
++
+ 	if state.UsageCount >= state.UsageLimit {
+ 		return signupTokenConsumeResponse{
+ 			Status: signupTokenConsumeLimitReached,
+ 		}, nil
+ 	}
+ 
+-	// Consume one use of the token
++	// Reserve one slot for this attempt
++	state.Attempts = append(state.Attempts, signupTokenAttempt{
++		ID:        req.AttemptID,
++		Status:    signupAttemptPending,
++		CreatedAt: time.Now(),
++	})
+ 	state.UsageCount++
+ 	err = a.setState(parentCtx, state)
+ 	if err != nil {
+ 		return signupTokenConsumeResponse{}, err
+ 	}
+ 
++	// Schedule the durable reconciliation that resolves the attempt if the request dies before reporting the outcome
++	err = a.scheduleReconciliation(parentCtx, req.AttemptID)
++	if err != nil {
++		return signupTokenConsumeResponse{}, err
++	}
++
+ 	return signupTokenConsumeResponse{
+ 		Status:       signupTokenConsumeOK,
+ 		UserGroupIDs: state.UserGroupIDs,
+ 	}, nil
+ }
+ 
+-// release reverts the usage count increment performed while consuming the token, to compensate when the signup could not be completed.
+-func (a *signupTokenActor) release(parentCtx context.Context) error {
++// complete marks an attempt completed once its user has been confirmed in the database.
++// It never frees a quota slot: a completed attempt stands for a committed user.
++func (a *signupTokenActor) complete(parentCtx context.Context, data actor.Envelope) error {
++	req, err := decodeAttemptRequest(data, signupTokenMethodComplete)
++	if err != nil {
++		return err
++	}
++
++	ctx, cancel := context.WithTimeout(parentCtx, 10*time.Second)
++	defer cancel()
++	state, err := a.client.GetState(ctx)
++	if err != nil {
++		return fmt.Errorf("error retrieving actor state: %w", err)
++	}
++
++	// The token is gone (revoked or expired): there's no accounting to update
++	if state.ID == "" {
++		return nil
++	}
++
++	idx := indexSignupAttempt(state.Attempts, req.AttemptID)
++	if idx >= 0 {
++		if state.Attempts[idx].Status == signupAttemptCompleted {
++			return nil
++		}
++
++		state.Attempts[idx].Status = signupAttemptCompleted
++		return a.setState(parentCtx, state)
++	}
++
++	// The attempt is missing: reconciliation may have released it just before a transaction that actually committed
++	// The committed user must keep occupying a slot, so re-add a completed attempt and restore the counter
++	state.UsageCount++
++	state.Attempts = append(state.Attempts, signupTokenAttempt{
++		ID:        req.AttemptID,
++		Status:    signupAttemptCompleted,
++		CreatedAt: time.Now(),
++	})
++	a.log.WarnContext(parentCtx, "Completed a signup attempt that was no longer pending; restored its quota slot",
++		slog.String("attemptId", req.AttemptID))
++	return a.setState(parentCtx, state)
++}
++
++// release frees the slot of one specific pending attempt.
++// It never decrements the counter for another attempt, and never touches a completed attempt (its user is committed).
++func (a *signupTokenActor) release(parentCtx context.Context, data actor.Envelope) error {
++	req, err := decodeAttemptRequest(data, signupTokenMethodRelease)
++	if err != nil {
++		return err
++	}
++
+ 	ctx, cancel := context.WithTimeout(parentCtx, 10*time.Second)
+ 	defer cancel()
+ 	state, err := a.client.GetState(ctx)
+@@ -174,15 +340,148 @@ func (a *signupTokenActor) release(parentCtx context.Context) error {
+ 		return fmt.Errorf("error retrieving actor state: %w", err)
+ 	}
+ 
+-	// The token is gone (for example, it expired and was purged) or was never consumed: nothing to compensate
+-	if state.ID == "" || state.UsageCount <= 0 {
++	// The token is gone or the attempt was never recorded/already resolved: there's nothing of ours to compensate
++	if state.ID == "" {
++		return nil
++	}
++
++	idx := indexSignupAttempt(state.Attempts, req.AttemptID)
++	if idx < 0 || state.Attempts[idx].Status != signupAttemptPending {
+ 		return nil
+ 	}
+ 
++	state.Attempts = append(state.Attempts[:idx], state.Attempts[idx+1:]...)
+ 	state.UsageCount--
++	if state.UsageCount < 0 {
++		state.UsageCount = 0
++	}
+ 	return a.setState(parentCtx, state)
+ }
+ 
++// reconcile applies a database lookup result to a pending attempt.
++func (a *signupTokenActor) reconcile(parentCtx context.Context, data actor.Envelope) (signupTokenReconcileResponse, error) {
++	var req signupTokenReconcileRequest
++	if data == nil {
++		return signupTokenReconcileResponse{}, fmt.Errorf("request body is empty for method '%s'", signupTokenMethodReconcile)
++	}
++	err := data.Decode(&req)
++	if err != nil {
++		return signupTokenReconcileResponse{}, fmt.Errorf("request body is not valid for method '%s': %w", signupTokenMethodReconcile, err)
++	}
++
++	status, err := a.applyReconciliation(parentCtx, req.AttemptID, req.UserExists)
++	if err != nil {
++		return signupTokenReconcileResponse{}, err
++	}
++
++	return signupTokenReconcileResponse{Status: status}, nil
++}
++
++// applyReconciliation contains the state transition shared by the "reconcile" method and the durable reconciliation job.
++func (a *signupTokenActor) applyReconciliation(parentCtx context.Context, attemptID string, userExists bool) (signupTokenReconcileStatus, error) {
++	ctx, cancel := context.WithTimeout(parentCtx, 10*time.Second)
++	defer cancel()
++	state, err := a.client.GetState(ctx)
++	if err != nil {
++		return "", fmt.Errorf("error retrieving actor state: %w", err)
++	}
++
++	// Token revoked/expired, attempt already resolved, or completed out of band: nothing to decide
++	if state.ID == "" {
++		return signupTokenReconcileNoop, nil
++	}
++	idx := indexSignupAttempt(state.Attempts, attemptID)
++	if idx < 0 || state.Attempts[idx].Status != signupAttemptPending {
++		return signupTokenReconcileNoop, nil
++	}
++
++	// A committed user wins over every other outcome: confirm the attempt and keep the slot
++	if userExists {
++		state.Attempts[idx].Status = signupAttemptCompleted
++		err = a.setState(parentCtx, state)
++		if err != nil {
++			return "", err
++		}
++		return signupTokenReconcileCompleted, nil
++	}
++
++	// Without a user, only release once the request that owns the attempt can plausibly be gone
++	if time.Since(state.Attempts[idx].CreatedAt) < attemptReconcileDelay {
++		return signupTokenReconcileDeferred, nil
++	}
++
++	state.Attempts = append(state.Attempts[:idx], state.Attempts[idx+1:]...)
++	state.UsageCount--
++	if state.UsageCount < 0 {
++		state.UsageCount = 0
++	}
++	err = a.setState(parentCtx, state)
++	if err != nil {
++		return "", err
++	}
++	return signupTokenReconcileReleased, nil
++}
++
++// Job implements actor.ActorJob and runs the durable reconciliation scheduled when an attempt is accepted
++func (a *signupTokenActor) Job(parentCtx context.Context, method string, data actor.Envelope) error {
++	if method != signupTokenJobReconcile {
++		return fmt.Errorf("%w: unsupported job method '%s'", actor.ErrJobPermanentFailure, method)
++	}
++
++	var req signupTokenAttemptRequest
++	if data == nil {
++		return fmt.Errorf("%w: job input is empty", actor.ErrJobPermanentFailure)
++	}
++	err := data.Decode(&req)
++	if err != nil {
++		return fmt.Errorf("%w: job input is not valid: %w", actor.ErrJobPermanentFailure, err)
++	}
++	if req.AttemptID == "" {
++		return fmt.Errorf("%w: job input is missing the attempt ID", actor.ErrJobPermanentFailure)
++	}
++	if a.reconciler == nil {
++		return fmt.Errorf("%w: no attempt reconciler is registered for the signup token actor", actor.ErrJobPermanentFailure)
++	}
++
++	ctx, cancel := context.WithTimeout(parentCtx, 10*time.Second)
++	defer cancel()
++	userExists, err := a.reconciler.UserExistsForAttempt(ctx, req.AttemptID)
++	if err != nil {
++		return fmt.Errorf("error looking up the user for signup attempt '%s': %w", req.AttemptID, err)
++	}
++
++	status, err := a.applyReconciliation(parentCtx, req.AttemptID, userExists)
++	if err != nil {
++		return err
++	}
++
++	switch status {
++	case signupTokenReconcileDeferred:
++		// The attempt is still within its grace window: fail so the framework retries the job later
++		return fmt.Errorf("signup attempt '%s' is still within its grace window", req.AttemptID)
++	case signupTokenReconcileCompleted:
++		// Restore post-commit side effects the request that committed the user may have died before running
++		a.reconciler.AttemptConfirmed(ctx, req.AttemptID)
++	case signupTokenReconcileReleased, signupTokenReconcileNoop:
++		// The slot was released or there was nothing to do: no further action
++	}
++
++	return nil
++}
++
++// JobFailed implements actor.ActorJobFailed and records the abandoned reconciliation for diagnosis
++func (a *signupTokenActor) JobFailed(ctx context.Context, _ string, _ string, data actor.Envelope, jobErr error) error {
++	var req signupTokenAttemptRequest
++	if data != nil {
++		_ = data.Decode(&req)
++	}
++
++	a.log.ErrorContext(ctx, "Giving up on reconciling a signup token attempt; its quota slot remains occupied",
++		slog.String("attemptId", req.AttemptID),
++		slog.Any("error", jobErr))
++	return nil
++}
++
+ // delete removes the token.
+ func (a *signupTokenActor) delete(parentCtx context.Context) error {
+ 	ctx, cancel := context.WithTimeout(parentCtx, 10*time.Second)
+@@ -196,6 +495,24 @@ func (a *signupTokenActor) delete(parentCtx context.Context) error {
+ 	return nil
+ }
+ 
++// scheduleReconciliation schedules the durable job that reconciles an attempt if its request never reports back.
++// The attempt ID is the job's idempotency key, so re-scheduling for the same attempt never creates duplicate jobs.
++func (a *signupTokenActor) scheduleReconciliation(parentCtx context.Context, attemptID string) error {
++	ctx, cancel := context.WithTimeout(parentCtx, 10*time.Second)
++	defer cancel()
++	_, _, err := a.client.Dispatch(ctx, signupTokenJobReconcile, signupTokenAttemptRequest{
++		AttemptID: attemptID,
++	},
++		actor.WithJobDelay(attemptReconcileDelay),
++		actor.WithIdempotencyKey(attemptID),
++	)
++	if err != nil {
++		return fmt.Errorf("error scheduling the reconciliation for signup attempt '%s': %w", attemptID, err)
++	}
++
++	return nil
++}
++
+ // setState saves the state with a TTL matching the token's remaining lifetime, so it's purged automatically once the token expires.
+ // Saving is skipped if the token has already expired, since there would be nothing left to store.
+ func (a *signupTokenActor) setState(parentCtx context.Context, state SignupTokenState) error {
+@@ -215,3 +532,38 @@ func (a *signupTokenActor) setState(parentCtx context.Context, state SignupToken
+ 
+ 	return nil
+ }
++
++// findSignupAttempt returns the attempt with the given ID, or nil when it isn't in the ledger
++func findSignupAttempt(attempts []signupTokenAttempt, attemptID string) *signupTokenAttempt {
++	idx := indexSignupAttempt(attempts, attemptID)
++	if idx < 0 {
++		return nil
++	}
++	return &attempts[idx]
++}
++
++// indexSignupAttempt returns the index of the attempt with the given ID, or -1 when it isn't in the ledger
++func indexSignupAttempt(attempts []signupTokenAttempt, attemptID string) int {
++	for i := range attempts {
++		if attempts[i].ID == attemptID {
++			return i
++		}
++	}
++	return -1
++}
++
++// decodeAttemptRequest decodes a request payload that only references an attempt
++func decodeAttemptRequest(data actor.Envelope, method string) (signupTokenAttemptRequest, error) {
++	var req signupTokenAttemptRequest
++	if data == nil {
++		return req, fmt.Errorf("request body is empty for method '%s'", method)
++	}
++	err := data.Decode(&req)
++	if err != nil {
++		return req, fmt.Errorf("request body is not valid for method '%s': %w", method, err)
++	}
++	if req.AttemptID == "" {
++		return req, fmt.Errorf("request for method '%s' is missing the attempt ID", method)
++	}
++	return req, nil
++}
+diff --git a/backend/internal/usersignup/actor_test.go b/backend/internal/usersignup/actor_test.go
+index c147a5bd..61a52a88 100644
+--- a/backend/internal/usersignup/actor_test.go
++++ b/backend/internal/usersignup/actor_test.go
+@@ -1,6 +1,10 @@
+ package usersignup
+ 
+ import (
++	"context"
++	"encoding/json"
++	"errors"
++	"log/slog"
+ 	"testing"
+ 	"time"
+ 
+@@ -26,15 +30,38 @@ func newSignupTokenActorService(t *testing.T) *actor.Service {
+ 	return svc
+ }
+ 
++// newSignupTokenActorServiceWithReconciler starts a test host whose signup token actors use the given reconciler
++func newSignupTokenActorServiceWithReconciler(t *testing.T, reconciler AttemptReconciler) *actor.Service {
++	t.Helper()
++
++	var svc *actor.Service
++	testutils.NewActorHostForTest(t, func(t *testing.T, h *local.Host) {
++		err := h.RegisterActor(SignupTokenActorType,
++			func(actorID string, actorService *actor.Service) actor.Actor {
++				return NewSignupTokenActorWithReconciler(actorID, actorService, reconciler)
++			},
++			local.WithMaxAttempts(attemptReconcileMaxAttempts),
++		)
++		require.NoError(t, err)
++		svc = h.Service()
++	})
++	require.NotNil(t, svc)
++
++	return svc
++}
++
+ func createSignupTokenForTest(t *testing.T, svc *actor.Service, token string, state SignupTokenState) {
+ 	t.Helper()
+ 	_, err := svc.Invoke(t.Context(), SignupTokenActorType, token, SignupTokenMethodCreate, state)
+ 	require.NoError(t, err)
+ }
+ 
+-func consumeSignupTokenForTest(t *testing.T, svc *actor.Service, token string) signupTokenConsumeResponse {
++// consumeSignupTokenForTest consumes one use of the token for the given attempt and returns the actor's response
++func consumeSignupTokenForTest(t *testing.T, svc *actor.Service, token, attemptID string) signupTokenConsumeResponse {
+ 	t.Helper()
+-	res, err := svc.Invoke(t.Context(), SignupTokenActorType, token, signupTokenMethodConsume, nil)
++	res, err := svc.Invoke(t.Context(), SignupTokenActorType, token, signupTokenMethodConsume, signupTokenConsumeRequest{
++		AttemptID: attemptID,
++	})
+ 	require.NoError(t, err)
+ 
+ 	var out signupTokenConsumeResponse
+@@ -44,6 +71,33 @@ func consumeSignupTokenForTest(t *testing.T, svc *actor.Service, token string) s
+ 	return out
+ }
+ 
++// invokeAttemptMethodForTest invokes one of the attempt-scoped methods with the given payload
++func invokeAttemptMethodForTest(t *testing.T, svc *actor.Service, token, method string, payload any) any {
++	t.Helper()
++	res, err := svc.Invoke(t.Context(), SignupTokenActorType, token, method, payload)
++	require.NoError(t, err)
++	if res == nil {
++		return nil
++	}
++
++	switch method {
++	case signupTokenMethodReconcile:
++		var out signupTokenReconcileResponse
++		require.NoError(t, res.Decode(&out))
++		return out
++	default:
++		return nil
++	}
++}
++
++// getSignupTokenStateForTest reads the raw stored state of a signup token
++func getSignupTokenStateForTest(t *testing.T, svc *actor.Service, token string) SignupTokenState {
++	t.Helper()
++	var state SignupTokenState
++	require.NoError(t, svc.GetState(t.Context(), SignupTokenActorType, token, &state))
++	return state
++}
++
+ // listSignupTokenIDsForTest returns the actor IDs (that is, the token values) of every stored signup token
+ func listSignupTokenIDsForTest(t *testing.T, svc *actor.Service) []string {
+ 	t.Helper()
+@@ -58,6 +112,34 @@ func listSignupTokenIDsForTest(t *testing.T, svc *actor.Service) []string {
+ 	return ids
+ }
+ 
++// jsonEnvelope is a minimal actor.Envelope used to call the Job handler directly in tests
++type jsonEnvelope struct {
++	payload any
++}
++
++func (e jsonEnvelope) Decode(into any) error {
++	b, err := json.Marshal(e.payload)
++	if err != nil {
++		return err
++	}
++	return json.Unmarshal(b, into)
++}
++
++// fakeAttemptReconciler is a scripted AttemptReconciler for actor tests
++type fakeAttemptReconciler struct {
++	userExists bool
++	err        error
++	confirmed  []string
++}
++
++func (f *fakeAttemptReconciler) UserExistsForAttempt(_ context.Context, _ string) (bool, error) {
++	return f.userExists, f.err
++}
++
++func (f *fakeAttemptReconciler) AttemptConfirmed(_ context.Context, attemptID string) {
++	f.confirmed = append(f.confirmed, attemptID)
++}
++
+ func TestSignupTokenActorConsume(t *testing.T) {
+ 	svc := newSignupTokenActorService(t)
+ 
+@@ -70,19 +152,86 @@ func TestSignupTokenActorConsume(t *testing.T) {
+ 	})
+ 
+ 	// First consume succeeds and returns the token's user groups
+-	res := consumeSignupTokenForTest(t, svc, "token-1")
++	res := consumeSignupTokenForTest(t, svc, "token-1", "attempt-1")
+ 	require.Equal(t, signupTokenConsumeOK, res.Status)
++	require.False(t, res.Replayed)
+ 	require.Equal(t, []string{"group-a", "group-b"}, res.UserGroupIDs)
+ 
+-	// Second consume fails: the usage limit (1) has been reached
+-	res = consumeSignupTokenForTest(t, svc, "token-1")
++	// The attempt occupies exactly one slot and is recorded as pending
++	state := getSignupTokenStateForTest(t, svc, "token-1")
++	require.Equal(t, 1, state.UsageCount)
++	require.Len(t, state.Attempts, 1)
++	require.Equal(t, "attempt-1", state.Attempts[0].ID)
++	require.Equal(t, signupAttemptPending, state.Attempts[0].Status)
++
++	// A different attempt fails: the usage limit (1) has been reached
++	res = consumeSignupTokenForTest(t, svc, "token-1", "attempt-2")
+ 	require.Equal(t, signupTokenConsumeLimitReached, res.Status)
+ }
+ 
++func TestSignupTokenActorConsumeReplayIsIdempotent(t *testing.T) {
++	svc := newSignupTokenActorService(t)
++
++	createSignupTokenForTest(t, svc, "token-replay", SignupTokenState{
++		ID:         "id-replay",
++		ExpiresAt:  time.Now().Add(time.Hour),
++		UsageLimit: 1,
++		CreatedAt:  time.Now(),
++	})
++
++	// The original accept reserves the slot
++	first := consumeSignupTokenForTest(t, svc, "token-replay", "attempt-replay")
++	require.Equal(t, signupTokenConsumeOK, first.Status)
++	require.False(t, first.Replayed)
++
++	// Replaying the same attempt returns it without occupying another slot
++	replay := consumeSignupTokenForTest(t, svc, "token-replay", "attempt-replay")
++	require.Equal(t, signupTokenConsumeOK, replay.Status)
++	require.True(t, replay.Replayed)
++
++	state := getSignupTokenStateForTest(t, svc, "token-replay")
++	require.Equal(t, 1, state.UsageCount)
++	require.Len(t, state.Attempts, 1)
++
++	// The replay must not have scheduled a second reconciliation job
++	jobs, err := svc.ListJobs(t.Context(), SignupTokenActorType, "token-replay")
++	require.NoError(t, err)
++	require.Len(t, jobs, 1)
++}
++
++func TestSignupTokenActorConsumeReplayAfterCompletion(t *testing.T) {
++	svc := newSignupTokenActorService(t)
++
++	createSignupTokenForTest(t, svc, "token-done", SignupTokenState{
++		ID:         "id-done",
++		ExpiresAt:  time.Now().Add(time.Hour),
++		UsageLimit: 2,
++		CreatedAt:  time.Now(),
++	})
++
++	require.Equal(t, signupTokenConsumeOK, consumeSignupTokenForTest(t, svc, "token-done", "attempt-done").Status)
++	invokeAttemptMethodForTest(t, svc, "token-done", signupTokenMethodComplete, signupTokenAttemptRequest{
++		AttemptID: "attempt-done",
++	})
++
++	// A replay of an already completed attempt succeeds without re-occupying a slot
++	replay := consumeSignupTokenForTest(t, svc, "token-done", "attempt-done")
++	require.Equal(t, signupTokenConsumeOK, replay.Status)
++	require.True(t, replay.Replayed)
++
++	state := getSignupTokenStateForTest(t, svc, "token-done")
++	require.Equal(t, 1, state.UsageCount)
++	require.Len(t, state.Attempts, 1)
++	require.Equal(t, signupAttemptCompleted, state.Attempts[0].Status)
++
++	// A fresh attempt can still use the remaining slot
++	require.Equal(t, signupTokenConsumeOK, consumeSignupTokenForTest(t, svc, "token-done", "attempt-new").Status)
++}
++
+ func TestSignupTokenActorConsumeNotFound(t *testing.T) {
+ 	svc := newSignupTokenActorService(t)
+ 
+-	res := consumeSignupTokenForTest(t, svc, "does-not-exist")
++	res := consumeSignupTokenForTest(t, svc, "does-not-exist", "attempt-x")
+ 	require.Equal(t, signupTokenConsumeNotFound, res.Status)
+ }
+ 
+@@ -98,30 +247,193 @@ func TestSignupTokenActorCreateExpired(t *testing.T) {
+ 	})
+ 
+ 	require.Empty(t, listSignupTokenIDsForTest(t, svc))
+-	require.Equal(t, signupTokenConsumeNotFound, consumeSignupTokenForTest(t, svc, "token-expired").Status)
++	require.Equal(t, signupTokenConsumeNotFound, consumeSignupTokenForTest(t, svc, "token-expired", "attempt-x").Status)
+ }
+ 
+-func TestSignupTokenActorRelease(t *testing.T) {
++func TestSignupTokenActorConsumeRejectsEmptyAttemptID(t *testing.T) {
+ 	svc := newSignupTokenActorService(t)
+ 
+-	createSignupTokenForTest(t, svc, "token-2", SignupTokenState{
+-		ID:         "id-2",
++	createSignupTokenForTest(t, svc, "token-empty", SignupTokenState{
++		ID:         "id-empty",
+ 		ExpiresAt:  time.Now().Add(time.Hour),
+-		UsageLimit: 2,
++		UsageLimit: 1,
++		CreatedAt:  time.Now(),
++	})
++
++	_, err := svc.Invoke(t.Context(), SignupTokenActorType, "token-empty", signupTokenMethodConsume, signupTokenConsumeRequest{})
++	require.Error(t, err)
++}
++
++// TestSignupTokenActorReleaseIsScopedToAttempt verifies releasing one attempt never frees another concurrent attempt's slot
++func TestSignupTokenActorReleaseIsScopedToAttempt(t *testing.T) {
++	svc := newSignupTokenActorService(t)
++
++	createSignupTokenForTest(t, svc, "token-parallel", SignupTokenState{
++		ID:         "id-parallel",
++		ExpiresAt:  time.Now().Add(time.Hour),
++		UsageLimit: 3,
+ 		CreatedAt:  time.Now(),
+ 	})
+ 
+-	// Consume both uses
+-	require.Equal(t, signupTokenConsumeOK, consumeSignupTokenForTest(t, svc, "token-2").Status)
+-	require.Equal(t, signupTokenConsumeOK, consumeSignupTokenForTest(t, svc, "token-2").Status)
+-	require.Equal(t, signupTokenConsumeLimitReached, consumeSignupTokenForTest(t, svc, "token-2").Status)
++	require.Equal(t, signupTokenConsumeOK, consumeSignupTokenForTest(t, svc, "token-parallel", "attempt-a").Status)
++	require.Equal(t, signupTokenConsumeOK, consumeSignupTokenForTest(t, svc, "token-parallel", "attempt-b").Status)
++	require.Equal(t, 2, getSignupTokenStateForTest(t, svc, "token-parallel").UsageCount)
+ 
+-	// Release one use (compensation)
+-	_, err := svc.Invoke(t.Context(), SignupTokenActorType, "token-2", signupTokenMethodRelease, nil)
+-	require.NoError(t, err)
++	// Failing signup A releases only A's slot
++	invokeAttemptMethodForTest(t, svc, "token-parallel", signupTokenMethodRelease, signupTokenAttemptRequest{
++		AttemptID: "attempt-a",
++	})
++
++	state := getSignupTokenStateForTest(t, svc, "token-parallel")
++	require.Equal(t, 1, state.UsageCount)
++	require.Len(t, state.Attempts, 1)
++	require.Equal(t, "attempt-b", state.Attempts[0].ID)
++	require.Equal(t, signupAttemptPending, state.Attempts[0].Status)
++
++	// Releasing A again or releasing an unknown attempt is a no-op, B's slot stays occupied
++	invokeAttemptMethodForTest(t, svc, "token-parallel", signupTokenMethodRelease, signupTokenAttemptRequest{
++		AttemptID: "attempt-a",
++	})
++	invokeAttemptMethodForTest(t, svc, "token-parallel", signupTokenMethodRelease, signupTokenAttemptRequest{
++		AttemptID: "attempt-unknown",
++	})
++	require.Equal(t, 1, getSignupTokenStateForTest(t, svc, "token-parallel").UsageCount)
++
++	// One slot is available again, and using it doesn't disturb B
++	require.Equal(t, signupTokenConsumeOK, consumeSignupTokenForTest(t, svc, "token-parallel", "attempt-c").Status)
++	state = getSignupTokenStateForTest(t, svc, "token-parallel")
++	require.Equal(t, 2, state.UsageCount)
++	require.ElementsMatch(t, []string{"attempt-b", "attempt-c"}, []string{
++		state.Attempts[0].ID, state.Attempts[1].ID,
++	})
++}
++
++// TestSignupTokenActorReleaseKeepsCompletedAttempt verifies a committed user's slot can never be released
++func TestSignupTokenActorReleaseKeepsCompletedAttempt(t *testing.T) {
++	svc := newSignupTokenActorService(t)
++
++	createSignupTokenForTest(t, svc, "token-keep", SignupTokenState{
++		ID:         "id-keep",
++		ExpiresAt:  time.Now().Add(time.Hour),
++		UsageLimit: 1,
++		CreatedAt:  time.Now(),
++	})
++
++	require.Equal(t, signupTokenConsumeOK, consumeSignupTokenForTest(t, svc, "token-keep", "attempt-keep").Status)
++	invokeAttemptMethodForTest(t, svc, "token-keep", signupTokenMethodComplete, signupTokenAttemptRequest{
++		AttemptID: "attempt-keep",
++	})
++
++	invokeAttemptMethodForTest(t, svc, "token-keep", signupTokenMethodRelease, signupTokenAttemptRequest{
++		AttemptID: "attempt-keep",
++	})
++
++	state := getSignupTokenStateForTest(t, svc, "token-keep")
++	require.Equal(t, 1, state.UsageCount)
++	require.Len(t, state.Attempts, 1)
++	require.Equal(t, signupAttemptCompleted, state.Attempts[0].Status)
++}
++
++// TestSignupTokenActorCompleteRestoresMissingAttempt verifies a late commit after reconciliation restores the slot
++func TestSignupTokenActorCompleteRestoresMissingAttempt(t *testing.T) {
++	svc := newSignupTokenActorService(t)
++
++	createSignupTokenForTest(t, svc, "token-late", SignupTokenState{
++		ID:         "id-late",
++		ExpiresAt:  time.Now().Add(time.Hour),
++		UsageLimit: 1,
++		CreatedAt:  time.Now(),
++	})
++
++	require.Equal(t, signupTokenConsumeOK, consumeSignupTokenForTest(t, svc, "token-late", "attempt-late").Status)
++	invokeAttemptMethodForTest(t, svc, "token-late", signupTokenMethodRelease, signupTokenAttemptRequest{
++		AttemptID: "attempt-late",
++	})
++	require.Zero(t, getSignupTokenStateForTest(t, svc, "token-late").UsageCount)
++
++	// The transaction actually committed: completing the missing attempt must restore its slot
++	invokeAttemptMethodForTest(t, svc, "token-late", signupTokenMethodComplete, signupTokenAttemptRequest{
++		AttemptID: "attempt-late",
++	})
++
++	state := getSignupTokenStateForTest(t, svc, "token-late")
++	require.Equal(t, 1, state.UsageCount)
++	require.Len(t, state.Attempts, 1)
++	require.Equal(t, signupAttemptCompleted, state.Attempts[0].Status)
++}
++
++// TestSignupTokenActorReconcile covers the recovery decisions for pending attempts
++func TestSignupTokenActorReconcile(t *testing.T) {
++	svc := newSignupTokenActorService(t)
++	now := time.Now()
++	createSignupTokenForTest(t, svc, "token-reconcile", SignupTokenState{
++		ID:         "id-reconcile",
++		ExpiresAt:  now.Add(time.Hour),
++		UsageLimit: 3,
++		UsageCount: 3,
++		CreatedAt:  now,
++		Attempts: []signupTokenAttempt{
++			// A young attempt whose request may still be running
++			{ID: "attempt-young", Status: signupAttemptPending, CreatedAt: now},
++			// An old attempt whose process is certainly gone
++			{ID: "attempt-old-gone", Status: signupAttemptPending, CreatedAt: now.Add(-10 * time.Minute)},
++			// An old attempt whose user committed before the crash
++			{ID: "attempt-old-done", Status: signupAttemptPending, CreatedAt: now.Add(-10 * time.Minute)},
++		},
++	})
++
++	reconcile := func(attemptID string, userExists bool) signupTokenReconcileStatus {
++		out := invokeAttemptMethodForTest(t, svc, "token-reconcile", signupTokenMethodReconcile, signupTokenReconcileRequest{
++			AttemptID:  attemptID,
++			UserExists: userExists,
++		}).(signupTokenReconcileResponse)
++		return out.Status
++	}
++
++	// Young + no user: wait
++	require.Equal(t, signupTokenReconcileDeferred, reconcile("attempt-young", false))
++	require.Equal(t, 3, getSignupTokenStateForTest(t, svc, "token-reconcile").UsageCount)
++
++	// Old + committed user: confirm and keep the slot
++	require.Equal(t, signupTokenReconcileCompleted, reconcile("attempt-old-done", true))
++	state := getSignupTokenStateForTest(t, svc, "token-reconcile")
++	require.Equal(t, 3, state.UsageCount)
++	require.Equal(t, signupAttemptCompleted, findSignupAttempt(state.Attempts, "attempt-old-done").Status)
++
++	// Old + no user: release only that slot
++	require.Equal(t, signupTokenReconcileReleased, reconcile("attempt-old-gone", false))
++	state = getSignupTokenStateForTest(t, svc, "token-reconcile")
++	require.Equal(t, 2, state.UsageCount)
++	require.Nil(t, findSignupAttempt(state.Attempts, "attempt-old-gone"))
++	require.NotNil(t, findSignupAttempt(state.Attempts, "attempt-young"))
++
++	// Reconciling again, a completed attempt, or an unknown attempt is a no-op
++	require.Equal(t, signupTokenReconcileNoop, reconcile("attempt-old-gone", false))
++	require.Equal(t, signupTokenReconcileNoop, reconcile("attempt-old-done", true))
++	require.Equal(t, signupTokenReconcileNoop, reconcile("attempt-unknown", false))
++	require.Equal(t, 2, getSignupTokenStateForTest(t, svc, "token-reconcile").UsageCount)
++}
+ 
+-	// Consuming succeeds again now that a use was released
+-	require.Equal(t, signupTokenConsumeOK, consumeSignupTokenForTest(t, svc, "token-2").Status)
++// TestSignupTokenActorLegacyStateKeepsAccounting verifies states written without an attempt ledger keep their usage count
++func TestSignupTokenActorLegacyStateKeepsAccounting(t *testing.T) {
++	svc := newSignupTokenActorService(t)
++
++	createSignupTokenForTest(t, svc, "token-legacy", SignupTokenState{
++		ID:         "id-legacy",
++		ExpiresAt:  time.Now().Add(time.Hour),
++		UsageLimit: 3,
++		UsageCount: 2,
++		CreatedAt:  time.Now(),
++	})
++
++	// One legacy-style use remains and is correctly enforced
++	res := consumeSignupTokenForTest(t, svc, "token-legacy", "attempt-new")
++	require.Equal(t, signupTokenConsumeOK, res.Status)
++	require.Equal(t, signupTokenConsumeLimitReached, consumeSignupTokenForTest(t, svc, "token-legacy", "attempt-newer").Status)
++
++	state := getSignupTokenStateForTest(t, svc, "token-legacy")
++	require.Equal(t, 3, state.UsageCount)
++	require.Len(t, state.Attempts, 1)
+ }
+ 
+ func TestSignupTokenActorDelete(t *testing.T) {
+@@ -141,7 +453,7 @@ func TestSignupTokenActorDelete(t *testing.T) {
+ 	require.Empty(t, listSignupTokenIDsForTest(t, svc))
+ 
+ 	// The token can no longer be consumed
+-	require.Equal(t, signupTokenConsumeNotFound, consumeSignupTokenForTest(t, svc, "token-3").Status)
++	require.Equal(t, signupTokenConsumeNotFound, consumeSignupTokenForTest(t, svc, "token-3", "attempt-x").Status)
+ 
+ 	// Deleting a token that no longer exists is a no-op
+ 	_, err = svc.Invoke(t.Context(), SignupTokenActorType, "token-3", SignupTokenMethodDelete, nil)
+@@ -161,13 +473,62 @@ func TestSignupTokenActorMigrateDoesNotOverwrite(t *testing.T) {
+ 	createSignupTokenForTest(t, svc, "token-4", state)
+ 
+ 	// Use the token once
+-	require.Equal(t, signupTokenConsumeOK, consumeSignupTokenForTest(t, svc, "token-4").Status)
++	require.Equal(t, signupTokenConsumeOK, consumeSignupTokenForTest(t, svc, "token-4", "attempt-1").Status)
+ 
+ 	// Re-running the migration must not reset the usage count
+ 	_, err := svc.Invoke(t.Context(), SignupTokenActorType, "token-4", signupTokenMethodMigrate, state)
+ 	require.NoError(t, err)
+ 
+ 	// Only one use is left, so a single consume succeeds and the next one doesn't
+-	require.Equal(t, signupTokenConsumeOK, consumeSignupTokenForTest(t, svc, "token-4").Status)
+-	require.Equal(t, signupTokenConsumeLimitReached, consumeSignupTokenForTest(t, svc, "token-4").Status)
++	require.Equal(t, signupTokenConsumeOK, consumeSignupTokenForTest(t, svc, "token-4", "attempt-2").Status)
++	require.Equal(t, signupTokenConsumeLimitReached, consumeSignupTokenForTest(t, svc, "token-4", "attempt-3").Status)
++}
++
++// TestSignupTokenActorJob verifies the durable reconciliation job drives the same transitions and signals deferral with a retryable error
++func TestSignupTokenActorJob(t *testing.T) {
++	reconciler := &fakeAttemptReconciler{userExists: true}
++	svc := newSignupTokenActorServiceWithReconciler(t, reconciler)
++
++	now := time.Now()
++	createSignupTokenForTest(t, svc, "token-job", SignupTokenState{
++		ID:         "id-job",
++		ExpiresAt:  now.Add(time.Hour),
++		UsageLimit: 2,
++		UsageCount: 2,
++		CreatedAt:  now,
++		Attempts: []signupTokenAttempt{
++			{ID: "attempt-done", Status: signupAttemptPending, CreatedAt: now.Add(-10 * time.Minute)},
++			{ID: "attempt-young", Status: signupAttemptPending, CreatedAt: now},
++		},
++	})
++
++	a := &signupTokenActor{
++		actorID:    "token-job",
++		log:        slog.Default(),
++		client:     actor.NewActorClient[SignupTokenState](SignupTokenActorType, "token-job", svc),
++		reconciler: reconciler,
++	}
++
++	// User exists: the job completes the attempt and restores the post-commit callback
++	require.NoError(t, a.Job(t.Context(), signupTokenJobReconcile, jsonEnvelope{payload: signupTokenAttemptRequest{AttemptID: "attempt-done"}}))
++	require.Equal(t, []string{"attempt-done"}, reconciler.confirmed)
++	require.Equal(t, signupAttemptCompleted, findSignupAttempt(getSignupTokenStateForTest(t, svc, "token-job").Attempts, "attempt-done").Status)
++
++	// Young attempt without a user: the job asks for a retry
++	reconciler.userExists = false
++	err := a.Job(t.Context(), signupTokenJobReconcile, jsonEnvelope{payload: signupTokenAttemptRequest{AttemptID: "attempt-young"}})
++	require.Error(t, err)
++	require.NotErrorIs(t, err, actor.ErrJobPermanentFailure)
++
++	// A database lookup error is a regular, retryable job failure
++	reconciler.err = errors.New("database unavailable")
++	err = a.Job(t.Context(), signupTokenJobReconcile, jsonEnvelope{payload: signupTokenAttemptRequest{AttemptID: "attempt-young"}})
++	require.Error(t, err)
++	require.NotErrorIs(t, err, actor.ErrJobPermanentFailure)
++
++	// Unknown methods and bad payloads fail permanently
++	err = a.Job(t.Context(), "nope", jsonEnvelope{payload: signupTokenAttemptRequest{}})
++	require.ErrorIs(t, err, actor.ErrJobPermanentFailure)
++	err = a.Job(t.Context(), signupTokenJobReconcile, jsonEnvelope{payload: signupTokenAttemptRequest{}})
++	require.ErrorIs(t, err, actor.ErrJobPermanentFailure)
+ }
+diff --git a/backend/internal/usersignup/dto.go b/backend/internal/usersignup/dto.go
+index b7a4aad4..a11ecaf5 100644
+--- a/backend/internal/usersignup/dto.go
++++ b/backend/internal/usersignup/dto.go
+@@ -8,10 +8,13 @@ import (
+ 
+ type signUpDto struct {
+ 	Username  string  `json:"username" binding:"required,username,min=1,max=50" unorm:"nfc"`
+-	Email     *string `json:"email" binding:"omitempty,email" unorm:"nfc"`
++	Email     *string `json:"email" binding:"omitempty,email"`
+ 	FirstName string  `json:"firstName" binding:"max=50" unorm:"nfc"`
+ 	LastName  string  `json:"lastName" binding:"max=50" unorm:"nfc"`
+ 	Token     string  `json:"token"`
++	// AttemptID is the stable identifier of one registration attempt, kept identical across retries of the same submission.
++	// It doubles as the new user's ID, so replaying a signup never creates a second account.
++	AttemptID string `json:"attemptId" binding:"omitempty,uuid"`
+ }
+ 
+ type signupTokenCreateDto struct {
+diff --git a/backend/internal/usersignup/migration_test.go b/backend/internal/usersignup/migration_test.go
+index 35515cfe..c3a2f1b2 100644
+--- a/backend/internal/usersignup/migration_test.go
++++ b/backend/internal/usersignup/migration_test.go
+@@ -136,10 +136,10 @@ func TestMigrateSignupTokens(t *testing.T) {
+ 	require.NotContains(t, byToken, "EXPIREDTOKEN0003")
+ 
+ 	// The migration is idempotent: re-running it doesn't reset a token that has been used since
+-	require.Equal(t, signupTokenConsumeOK, consumeSignupTokenForTest(t, svc.actorService, "TOKENNOGROUP0002").Status)
++	require.Equal(t, signupTokenConsumeOK, consumeSignupTokenForTest(t, svc.actorService, "TOKENNOGROUP0002", "migration-attempt-1").Status)
+ 	err = svc.migrateSignupTokens(t.Context())
+ 	require.NoError(t, err)
+-	require.Equal(t, signupTokenConsumeLimitReached, consumeSignupTokenForTest(t, svc.actorService, "TOKENNOGROUP0002").Status)
++	require.Equal(t, signupTokenConsumeLimitReached, consumeSignupTokenForTest(t, svc.actorService, "TOKENNOGROUP0002", "migration-attempt-2").Status)
+ }
+ 
+ // TestLoadMigratedSignupTokensEmpty verifies that when there were no signup tokens, nothing is frozen and nothing is loaded.
+diff --git a/backend/internal/usersignup/models.go b/backend/internal/usersignup/models.go
+index 7c3b31cb..e84bc7db 100644
+--- a/backend/internal/usersignup/models.go
++++ b/backend/internal/usersignup/models.go
+@@ -1,6 +1,8 @@
+ package usersignup
+ 
+ import (
++	"time"
++
+ 	"github.com/pocket-id/pocket-id/backend/internal/model"
+ 	datatype "github.com/pocket-id/pocket-id/backend/internal/model/types"
+ )
+@@ -15,3 +17,21 @@ type SignupToken struct {
+ 	UsageCount int               `json:"usageCount" sortable:"true"`
+ 	UserGroups []model.UserGroup `json:"userGroups"`
+ }
++
++// signupAttemptStatus is the lifecycle stage of one accepted token usage
++type signupAttemptStatus string
++
++const (
++	// signupAttemptPending means the token use is occupied but no committed user has been confirmed yet
++	signupAttemptPending signupAttemptStatus = "pending"
++	// signupAttemptCompleted means the user created by this attempt has been confirmed in the database
++	signupAttemptCompleted signupAttemptStatus = "completed"
++)
++
++// signupTokenAttempt is one accepted usage of a signup token.
++// Its ID is the stable attempt identifier and doubles as the ID of the user this attempt creates, so the occupied quota slot is tied to exactly one database user.
++type signupTokenAttempt struct {
++	ID        string              `json:"id"`
++	Status    signupAttemptStatus `json:"status"`
++	CreatedAt time.Time           `json:"createdAt"`
++}
+diff --git a/backend/internal/usersignup/module.go b/backend/internal/usersignup/module.go
+index 102968f7..39a86259 100644
+--- a/backend/internal/usersignup/module.go
++++ b/backend/internal/usersignup/module.go
+@@ -6,7 +6,9 @@ import (
+ 	"time"
+ 
+ 	"github.com/gin-gonic/gin"
++	"github.com/italypaleale/francis/actor"
+ 	francishost "github.com/italypaleale/francis/host"
++	"github.com/italypaleale/francis/host/local"
+ 	"gorm.io/gorm"
+ 
+ 	"github.com/pocket-id/pocket-id/backend/internal/appconfig"
+@@ -51,22 +53,29 @@ type Module struct {
+ }
+ 
+ func New(deps Dependencies) (*Module, error) {
++	service := newService(deps, deps.Actors.Service())
++
+ 	// Register the actor that manages a signup token
+ 	// Each token is its own actor, whose actor ID is the token's value
+-	err := deps.Actors.RegisterActor(SignupTokenActorType, NewSignupTokenActor)
++	// The factory closure gives the actor the service as its AttemptReconciler for crash recovery jobs
++	err := deps.Actors.RegisterActor(SignupTokenActorType,
++		func(actorID string, actorService *actor.Service) actor.Actor {
++			return NewSignupTokenActorWithReconciler(actorID, actorService, service)
++		},
++		local.WithMaxAttempts(attemptReconcileMaxAttempts),
++	)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("error registering the %s actor: %w", SignupTokenActorType, err)
+ 	}
+ 
+-	service := newService(deps, deps.Actors.Service())
+ 	return &Module{
+ 		service: service,
+ 		handler: newHandler(service, deps.AppConfig),
+ 	}, nil
+ }
+ 
+-// RunSignupTokenMigration performs the one-time migration of the pre-actor signup tokens, then blocks until the context is canceled.
+-// It's meant to be started as a background service gated on the actor host being ready, since the migration needs the actor state store.
++// RunSignupTokenMigration performs the one-time migration of the pre-actor signup tokens and recovers pending attempts, then blocks until the context is canceled.
++// It's meant to be started as a background service gated on the actor host being ready, since both steps need the actor state store.
+ // Note that it must not return before the context is canceled, as the service runner stops the application as soon as any of its services returns.
+ func (m *Module) RunSignupTokenMigration(ctx context.Context) error {
+ 	err := m.service.migrateSignupTokens(ctx)
+@@ -74,6 +83,12 @@ func (m *Module) RunSignupTokenMigration(ctx context.Context) error {
+ 		return fmt.Errorf("failed to migrate signup tokens: %w", err)
+ 	}
+ 
++	// Reconcile attempts left pending by a process that died after reserving the slot but before reporting the outcome
++	err = m.service.recoverPendingAttempts(ctx)
++	if err != nil {
++		return fmt.Errorf("failed to recover pending signup attempts: %w", err)
++	}
++
+ 	<-ctx.Done()
+ 	return ctx.Err()
+ }
+diff --git a/backend/internal/usersignup/service.go b/backend/internal/usersignup/service.go
+index 350a06f7..c5096956 100644
+--- a/backend/internal/usersignup/service.go
++++ b/backend/internal/usersignup/service.go
+@@ -2,6 +2,7 @@ package usersignup
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"log/slog"
+ 	"sort"
+@@ -10,6 +11,7 @@ import (
+ 	"uuid"
+ 
+ 	"github.com/italypaleale/francis/actor"
++	"github.com/italypaleale/francis/protocol"
+ 	"gorm.io/gorm"
+ 
+ 	"github.com/pocket-id/pocket-id/backend/internal/appconfig"
+@@ -53,13 +55,22 @@ func (s *Service) SignUp(ctx context.Context, config *appconfig.AppConfigModel,
+ 		return model.User{}, "", apperror.OpenSignupDisabled()
+ 	}
+ 
++	// The attempt ID identifies this registration across retries and doubles as the new user's ID, so every replay lands on the same users row
++	attemptID := signupData.AttemptID
++
+ 	var userGroupIDs []string
+ 	if tokenProvided {
+-		// Consume the signup token by invoking its actor: this atomically validates it and increments its usage count
++		if attemptID == "" {
++			attemptID = uuid.NewV4().String()
++		}
++
++		// Consume the signup token by invoking its actor: this atomically validates it and reserves one quota slot for this exact attempt
+ 		// Note: must invoke outside of a DB transaction, since invoking an actor while a transaction is open would deadlock on SQLite
+-		res, err := s.actorService.Invoke(ctx, SignupTokenActorType, signupData.Token, signupTokenMethodConsume, nil)
++		res, err := s.actorService.Invoke(ctx, SignupTokenActorType, signupData.Token, signupTokenMethodConsume, signupTokenConsumeRequest{
++			AttemptID: attemptID,
++		})
+ 		if err != nil {
+-			return model.User{}, "", fmt.Errorf("error invoking signup token actor: %w", err)
++			return model.User{}, "", mapSignupActorUnavailable(fmt.Errorf("error invoking signup token actor: %w", err))
+ 		}
+ 
+ 		var consumeRes signupTokenConsumeResponse
+@@ -68,6 +79,7 @@ func (s *Service) SignUp(ctx context.Context, config *appconfig.AppConfigModel,
+ 			return model.User{}, "", fmt.Errorf("error decoding signup token actor response: %w", err)
+ 		}
+ 
++		// not_found (expired or deleted token) and limit_reached share the public response but stay distinct statuses internally
+ 		if consumeRes.Status != signupTokenConsumeOK {
+ 			return model.User{}, "", apperror.TokenInvalidOrExpired()
+ 		}
+@@ -83,20 +95,132 @@ func (s *Service) SignUp(ctx context.Context, config *appconfig.AppConfigModel,
+ 		UserGroupIds:  userGroupIDs,
+ 		EmailVerified: config.EmailsVerified.IsTrue(),
+ 	}
++	// The attempt ID only ties token signups to their quota slot; open signups keep server-generated user IDs
++	if tokenProvided {
++		userToCreate.ID = attemptID
++	}
+ 
+-	// The token has now been consumed
+-	// From this point on, if we hit an error we compensate by releasing the token (best-effort)
++	// A replay whose user was already committed must not create another account: confirm the attempt and return the existing user
++	if tokenProvided {
++		existing, found, err := s.findCommittedUser(ctx, attemptID)
++		if err != nil {
++			// With the database unreadable we cannot tell whether a user exists, so leave the attempt pending for durable reconciliation
++			return model.User{}, "", err
++		}
++		if found {
++			// Only the request with the attempt's original profile may claim its session, so a guessed attempt ID can't mint a token for someone else
++			if conflictField, matches := replayProfileMatch(signupData, existing); !matches {
++				s.markAttemptCompleted(ctx, signupData.Token, attemptID)
++				return model.User{}, "", apperror.AlreadyInUse(conflictField)
++			}
++			return s.finishReplayedSignup(ctx, config, signupData.Token, existing)
++		}
++	}
++
++	// From here on the attempt is pending: create the user, issue the token, and write the audit log in one transaction
+ 	user, accessToken, err := s.createSignedUpUser(ctx, config, userToCreate, signupData.Token, tokenProvided, ipAddress, userAgent)
+-	if err != nil {
++	if err == nil {
+ 		if tokenProvided {
+-			s.releaseSignupToken(ctx, signupData.Token)
++			s.markAttemptCompleted(ctx, signupData.Token, attemptID)
+ 		}
++		return user, accessToken, nil
++	}
++
++	if !tokenProvided {
+ 		return model.User{}, "", err
+ 	}
+ 
++	// The request failed: decide the attempt's fate from what actually landed in the database instead of blindly freeing a slot
++	return s.resolveFailedSignup(ctx, config, signupData, attemptID, err)
++}
++
++// replayProfileMatch checks whether a replay request carries the same unique profile the attempt created.
++// It returns the conflicting field name when the request must not be treated as that attempt's replay.
++func replayProfileMatch(signupData signUpDto, user model.User) (string, bool) {
++	if !strings.EqualFold(user.Username, signupData.Username) {
++		return "username", false
++	}
++
++	email := ""
++	if signupData.Email != nil {
++		email = *signupData.Email
++	}
++	userEmail := ""
++	if user.Email != nil {
++		userEmail = *user.Email
++	}
++	if !strings.EqualFold(userEmail, email) {
++		return "email", false
++	}
++
++	return "", true
++}
++
++// finishReplayedSignup completes an attempt whose user already exists and returns a fresh session for that user.
++// The audit log was written by the original committing request, so it isn't written again; the SCIM schedule is idempotent.
++func (s *Service) finishReplayedSignup(ctx context.Context, config *appconfig.AppConfigModel, token string, user model.User) (model.User, string, error) {
++	s.markAttemptCompleted(ctx, token, user.ID)
++
++	accessToken, err := s.signer.GenerateAccessToken(user, "", config.SessionDuration.AsDurationMinutes())
++	if err != nil {
++		return model.User{}, "", err
++	}
++
++	s.scheduleScimSync(ctx)
+ 	return user, accessToken, nil
+ }
+ 
++// resolveFailedSignup reconciles an attempt after its request returned an error.
++// A committed user wins: the attempt is completed and the signup is recovered as success.
++// Without a user the transaction rolled back, so only this attempt's slot is released.
++func (s *Service) resolveFailedSignup(ctx context.Context, config *appconfig.AppConfigModel, signupData signUpDto, attemptID string, cause error) (model.User, string, error) {
++	user, found, lookupErr := s.findCommittedUser(ctx, attemptID)
++	if lookupErr != nil {
++		// Whether the transaction committed is now undecidable: leave the attempt pending and let durable reconciliation resolve it after re-checking the database
++		slog.ErrorContext(ctx, "Unable to determine whether the signup transaction committed; leaving the attempt pending for reconciliation",
++			slog.String("attemptId", attemptID),
++			slog.Any("signupError", cause),
++			slog.Any("lookupError", lookupErr))
++		return model.User{}, "", cause
++	}
++
++	if !found {
++		s.releaseSignupAttempt(ctx, signupData.Token, attemptID)
++		return model.User{}, "", cause
++	}
++
++	// A committed user with a different profile isn't this request's account: keep the attempt completed but don't hand over a session
++	if conflictField, matches := replayProfileMatch(signupData, user); !matches {
++		s.markAttemptCompleted(ctx, signupData.Token, attemptID)
++		return model.User{}, "", apperror.AlreadyInUse(conflictField)
++	}
++
++	// The user was committed despite the error (an uncertain commit result, or a lost race with a concurrent replay): confirm rather than duplicate
++	s.markAttemptCompleted(ctx, signupData.Token, attemptID)
++
++	accessToken, err := s.signer.GenerateAccessToken(user, "", config.SessionDuration.AsDurationMinutes())
++	if err != nil {
++		return model.User{}, "", err
++	}
++
++	s.scheduleScimSync(ctx)
++	return user, accessToken, nil
++}
++
++// findCommittedUser looks up a user by the attempt ID outside any signup transaction.
++func (s *Service) findCommittedUser(ctx context.Context, attemptID string) (model.User, bool, error) {
++	var user model.User
++	err := s.db.WithContext(ctx).Where("id = ?", attemptID).First(&user).Error
++	if errors.Is(err, gorm.ErrRecordNotFound) {
++		return model.User{}, false, nil
++	}
++	if err != nil {
++		return model.User{}, false, fmt.Errorf("error looking up the user of signup attempt '%s': %w", attemptID, err)
++	}
++
++	return user, true, nil
++}
++
+ // createSignedUpUser creates the user and issues an access token within a single transaction.
+ // It performs no actor calls, so it's safe to keep the transaction open for its whole duration.
+ func (s *Service) createSignedUpUser(ctx context.Context, config *appconfig.AppConfigModel, userToCreate dto.UserCreateDto, token string, tokenProvided bool, ipAddress, userAgent string) (model.User, string, error) {
+@@ -127,28 +251,190 @@ func (s *Service) createSignedUpUser(ctx context.Context, config *appconfig.AppC
+ 
+ 	err = tx.Commit().Error
+ 	if err != nil {
+-		return model.User{}, "", err
+-	}
+-	if s.scimSync != nil {
+-		s.scimSync.ScheduleSync(ctx)
++		// A commit error is ambiguous (the transaction may have landed): the caller verifies the outcome against the database
++		return model.User{}, "", fmt.Errorf("error committing the new user transaction: %w", err)
+ 	}
+ 
++	s.scheduleScimSync(ctx)
+ 	return user, accessToken, nil
+ }
+ 
+-// releaseSignupToken reverts the usage count increment performed while consuming a token, used to compensate when the signup could not be completed.
+-// It's a best-effort compensation: if it fails (or the process crashes before it runs) we accept that a token use was consumed unnecessarily
+-func (s *Service) releaseSignupToken(parentCtx context.Context, token string) {
+-	// Use a context that is not canceled when the original request ends
++// markAttemptCompleted tells the actor that the attempt's user is committed, so its slot stays occupied.
++// It's best-effort: if the actor is unreachable, the durable reconciliation job confirms the attempt after seeing the user.
++func (s *Service) markAttemptCompleted(parentCtx context.Context, token, attemptID string) {
++	err := s.invokeSignupTokenActor(parentCtx, token, signupTokenMethodComplete, signupTokenAttemptRequest{
++		AttemptID: attemptID,
++	})
++	if err != nil {
++		slog.ErrorContext(parentCtx, "Failed to mark a signup attempt completed; reconciliation will confirm it",
++			slog.String("attemptId", attemptID),
++			slog.Any("error", err))
++	}
++}
++
++// releaseSignupAttempt frees the slot belonging to one specific attempt, used to compensate when the signup could not commit a user.
++// It's best-effort: if the actor is unreachable, the durable reconciliation job releases the attempt once the database shows no user for it.
++func (s *Service) releaseSignupAttempt(parentCtx context.Context, token, attemptID string) {
++	err := s.invokeSignupTokenActor(parentCtx, token, signupTokenMethodRelease, signupTokenAttemptRequest{
++		AttemptID: attemptID,
++	})
++	if err != nil {
++		slog.ErrorContext(parentCtx, "Failed to release a signup attempt after a failed signup; reconciliation will release it",
++			slog.String("attemptId", attemptID),
++			slog.Any("error", err))
++	}
++}
++
++// invokeSignupTokenActor invokes one method of a signup token actor with a context that survives the request's cancellation.
++func (s *Service) invokeSignupTokenActor(parentCtx context.Context, token, method string, payload any) error {
+ 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parentCtx), 10*time.Second)
+ 	defer cancel()
+ 
+-	_, err := s.actorService.Invoke(ctx, SignupTokenActorType, token, signupTokenMethodRelease, nil)
++	_, err := s.actorService.Invoke(ctx, SignupTokenActorType, token, method, payload)
+ 	if err != nil {
+-		slog.ErrorContext(ctx, "Failed to release signup token after a failed signup", slog.Any("error", err))
++		return fmt.Errorf("error invoking signup token actor method '%s': %w", method, err)
++	}
++
++	return nil
++}
++
++// scheduleScimSync requests a SCIM synchronization after a user change has committed.
++// Scheduling replaces a single debounced alarm, so replaying a signup never duplicates the side effect.
++func (s *Service) scheduleScimSync(ctx context.Context) {
++	if s.scimSync != nil {
++		s.scimSync.ScheduleSync(ctx)
+ 	}
+ }
+ 
++// UserExistsForAttempt implements AttemptReconciler for recovery jobs
++func (s *Service) UserExistsForAttempt(ctx context.Context, attemptID string) (bool, error) {
++	_, found, err := s.findCommittedUser(ctx, attemptID)
++	return found, err
++}
++
++// AttemptConfirmed implements AttemptReconciler and restores the post-commit side effect a crashed request may have missed
++func (s *Service) AttemptConfirmed(ctx context.Context, attemptID string) {
++	slog.InfoContext(ctx, "Recovered a signup attempt whose user was already committed",
++		slog.String("attemptId", attemptID))
++	s.scheduleScimSync(ctx)
++}
++
++// mapSignupActorUnavailable turns transient actor-routing failures into a distinct, retryable client error while keeping other failures as internal errors.
++// Retrying with the same attempt ID is always safe: the actor either never accepted the use or returns the existing attempt.
++func mapSignupActorUnavailable(err error) error {
++	retryableProtocolCodes := []protocol.ErrorCode{
++		protocol.ErrCodeTransportFailure,
++		protocol.ErrCodeRetryLater,
++		protocol.ErrCodeOverloaded,
++		protocol.ErrCodeHostDraining,
++		protocol.ErrCodeDeadlineExceeded,
++		protocol.ErrCodeNoHost,
++		protocol.ErrCodeSessionSuperseded,
++	}
++	for _, code := range retryableProtocolCodes {
++		if errors.Is(err, protocol.NewError(code, "")) {
++			return apperror.SignupTemporarilyUnavailable()
++		}
++	}
++
++	switch {
++	case errors.Is(err, actor.ErrNoHost),
++		errors.Is(err, actor.ErrActorHalted),
++		errors.Is(err, actor.ErrActorNotHosted),
++		errors.Is(err, actor.ErrActorTypeUnsupported),
++		errors.Is(err, context.DeadlineExceeded):
++		return apperror.SignupTemporarilyUnavailable()
++	default:
++		return apperror.Internal(err)
++	}
++}
++
++// recoverPendingAttempts reconciles every pending attempt after a restart, covering attempts whose durable job was lost with the process.
++// Young attempts are skipped: another replica may still be serving their request, and the delayed job handles them.
++func (s *Service) recoverPendingAttempts(ctx context.Context) error {
++	entries, err := s.listSignupTokenStates(ctx)
++	if err != nil {
++		return err
++	}
++
++	// Collect every pending attempt so user lookups can run in one batch
++	pendingByToken := make(map[string][]signupTokenAttempt)
++	pendingIDs := make([]string, 0)
++	for _, e := range entries {
++		for _, a := range e.State.Attempts {
++			if a.Status != signupAttemptPending {
++				continue
++			}
++			pendingByToken[e.Token] = append(pendingByToken[e.Token], a)
++			pendingIDs = append(pendingIDs, a.ID)
++		}
++	}
++	if len(pendingIDs) == 0 {
++		return nil
++	}
++
++	existingUsers, err := s.lookupExistingAttemptUsers(ctx, pendingIDs)
++	if err != nil {
++		return err
++	}
++
++	var recovered, released int
++	for token, attempts := range pendingByToken {
++		for _, a := range attempts {
++			res, err := s.actorService.Invoke(ctx, SignupTokenActorType, token, signupTokenMethodReconcile, signupTokenReconcileRequest{
++				AttemptID:  a.ID,
++				UserExists: existingUsers[a.ID],
++			})
++			if err != nil {
++				return fmt.Errorf("error reconciling signup attempt '%s' on token '%s': %w", a.ID, token, err)
++			}
++
++			var reconcileRes signupTokenReconcileResponse
++			err = res.Decode(&reconcileRes)
++			if err != nil {
++				return fmt.Errorf("error decoding reconciliation response for attempt '%s': %w", a.ID, err)
++			}
++
++			switch reconcileRes.Status {
++			case signupTokenReconcileCompleted:
++				recovered++
++				s.AttemptConfirmed(ctx, a.ID)
++			case signupTokenReconcileReleased:
++				released++
++			case signupTokenReconcileDeferred, signupTokenReconcileNoop:
++				// Young attempts wait for their delayed job, and resolved attempts need no action
++			}
++		}
++	}
++
++	if recovered > 0 || released > 0 {
++		slog.InfoContext(ctx, "Recovered pending signup attempts after startup",
++			slog.Int("confirmed", recovered),
++			slog.Int("released", released))
++	}
++
++	return nil
++}
++
++// lookupExistingAttemptUsers returns which of the given attempt IDs already have a committed user.
++func (s *Service) lookupExistingAttemptUsers(ctx context.Context, attemptIDs []string) (map[string]bool, error) {
++	var foundIDs []string
++	err := s.db.WithContext(ctx).
++		Model(&model.User{}).
++		Where("id IN ?", attemptIDs).
++		Pluck("id", &foundIDs).
++		Error
++	if err != nil {
++		return nil, fmt.Errorf("error looking up users for pending signup attempts: %w", err)
++	}
++
++	existing := make(map[string]bool, len(foundIDs))
++	for _, id := range foundIDs {
++		existing[id] = true
++	}
++	return existing, nil
++}
++
+ func (s *Service) SignUpInitialAdmin(ctx context.Context, config *appconfig.AppConfigModel, signUpData signUpDto) (model.User, string, error) {
+ 	tx := s.db.Begin()
+ 	defer func() {
+@@ -195,9 +481,7 @@ func (s *Service) SignUpInitialAdmin(ctx context.Context, config *appconfig.AppC
+ 	if err != nil {
+ 		return model.User{}, "", err
+ 	}
+-	if s.scimSync != nil {
+-		s.scimSync.ScheduleSync(ctx)
+-	}
++	s.scheduleScimSync(ctx)
+ 
+ 	return user, token, nil
+ }
+@@ -490,7 +774,7 @@ func sortSignupTokens(tokens []SignupToken, column, direction string) {
+ 	case "createdAt", "":
+ 		// Use the default comparator (creation date)
+ 	default:
+-		// Unknown or non-sortable column: keep the default (creation date) ordering
++		// Unknown or non-sortable column: keep the default (creation date)
+ 	}
+ 
+ 	sort.SliceStable(tokens, func(i, j int) bool {
+diff --git a/backend/internal/usersignup/service_test.go b/backend/internal/usersignup/service_test.go
+index 0090f002..8e84c252 100644
+--- a/backend/internal/usersignup/service_test.go
++++ b/backend/internal/usersignup/service_test.go
+@@ -3,9 +3,15 @@ package usersignup
+ import (
+ 	"context"
+ 	"errors"
++	"fmt"
++	"sync"
+ 	"testing"
+ 	"time"
++	"uuid"
+ 
++	"github.com/italypaleale/francis/actor"
++	"github.com/italypaleale/francis/host/local"
++	"github.com/italypaleale/francis/protocol"
+ 	"github.com/stretchr/testify/require"
+ 	"gorm.io/gorm"
+ 
+@@ -30,6 +36,26 @@ func (f fakeUserCreator) CreateUserInternal(_ context.Context, _ *appconfig.AppC
+ 	return f.user, nil
+ }
+ 
++// dbUserCreator persists the user (with the attempt ID as primary key) inside the transaction, so tests exercise the real uniqueness constraints
++type dbUserCreator struct{}
++
++func (dbUserCreator) CreateUserInternal(ctx context.Context, _ *appconfig.AppConfigModel, input dto.UserCreateDto, _ bool, tx *gorm.DB) (model.User, error) {
++	user := model.User{
++		Base: model.Base{
++			ID: input.ID,
++		},
++		Username:    input.Username,
++		Email:       input.Email,
++		FirstName:   input.FirstName,
++		LastName:    input.LastName,
++		DisplayName: input.DisplayName,
++	}
++	if err := tx.WithContext(ctx).Create(&user).Error; err != nil {
++		return model.User{}, err
++	}
++	return user, nil
++}
++
+ type fakeSigner struct{}
+ 
+ func (fakeSigner) GenerateAccessToken(_ model.User, _ string, _ time.Duration) (string, error) {
+@@ -42,15 +68,50 @@ func (fakeAuditLogger) Create(_ context.Context, _ auditlogs.Event, _, _, _ stri
+ 	return auditlogs.AuditLog{}, true
+ }
+ 
++// lazyAttemptReconciler resolves the service only once an actor activation happens, breaking the factory/service construction cycle
++type lazyAttemptReconciler struct {
++	svc **Service
++}
++
++func (l lazyAttemptReconciler) UserExistsForAttempt(ctx context.Context, attemptID string) (bool, error) {
++	s := *l.svc
++	if s == nil {
++		return false, errors.New("signup service not initialized yet")
++	}
++	return s.UserExistsForAttempt(ctx, attemptID)
++}
++
++func (l lazyAttemptReconciler) AttemptConfirmed(ctx context.Context, attemptID string) {
++	if s := *l.svc; s != nil {
++		s.AttemptConfirmed(ctx, attemptID)
++	}
++}
++
+ func newSignupServiceForTest(t *testing.T, db *gorm.DB, userCreator UserCreator) *Service {
+ 	t.Helper()
+-	actorService := newSignupTokenActorService(t)
+-	return newService(Dependencies{
++	var (
++		svc      *Service
++		actorSvc *actor.Service
++	)
++	testutils.NewActorHostForTest(t, func(t *testing.T, h *local.Host) {
++		// Register the actor with the reconciler so recovery jobs behave like in production
++		err := h.RegisterActor(SignupTokenActorType,
++			func(actorID string, actorService *actor.Service) actor.Actor {
++				return NewSignupTokenActorWithReconciler(actorID, actorService, lazyAttemptReconciler{svc: &svc})
++			},
++			local.WithMaxAttempts(attemptReconcileMaxAttempts),
++		)
++		require.NoError(t, err)
++		actorSvc = h.Service()
++	})
++
++	svc = newService(Dependencies{
+ 		DB:          db,
+ 		UserCreator: userCreator,
+ 		Signer:      fakeSigner{},
+ 		AuditLog:    fakeAuditLogger{},
+-	}, actorService)
++	}, actorSvc)
++	return svc
+ }
+ 
+ func signupTokenUsageCount(t *testing.T, svc *Service, tokenID string) int {
+@@ -66,6 +127,22 @@ func signupTokenUsageCount(t *testing.T, svc *Service, tokenID string) int {
+ 	return 0
+ }
+ 
++// signupTokenStateForTest reads the raw actor state of a token by its value
++func signupTokenStateForTest(t *testing.T, svc *Service, token string) SignupTokenState {
++	t.Helper()
++	var state SignupTokenState
++	require.NoError(t, svc.actorService.GetState(t.Context(), SignupTokenActorType, token, &state))
++	return state
++}
++
++// countUsersForTest counts the users currently stored in the database
++func countUsersForTest(t *testing.T, db *gorm.DB) int64 {
++	t.Helper()
++	var count int64
++	require.NoError(t, db.WithContext(t.Context()).Model(&model.User{}).Count(&count).Error)
++	return count
++}
++
+ func TestSignUpConsumesTokenOnSuccess(t *testing.T) {
+ 	db := testutils.NewDatabaseForTest(t)
+ 	svc := newSignupServiceForTest(t, db, fakeUserCreator{user: model.User{Base: model.Base{ID: "new-user"}}})
+@@ -75,8 +152,9 @@ func TestSignUpConsumesTokenOnSuccess(t *testing.T) {
+ 
+ 	config := appconfig.NewTestConfig(nil)
+ 	user, accessToken, err := svc.SignUp(t.Context(), config, signUpDto{
+-		Username: "newuser",
+-		Token:    token.Token,
++		Username:  "newuser",
++		Token:     token.Token,
++		AttemptID: uuid.NewV4().String(),
+ 	}, "1.2.3.4", "test-agent")
+ 	require.NoError(t, err)
+ 	require.Equal(t, "new-user", user.ID)
+@@ -96,23 +174,301 @@ func TestSignUpCompensatesTokenOnFailure(t *testing.T) {
+ 
+ 	config := appconfig.NewTestConfig(nil)
+ 	_, _, err = svc.SignUp(t.Context(), config, signUpDto{
+-		Username: "newuser",
+-		Token:    token.Token,
++		Username:  "newuser",
++		Token:     token.Token,
++		AttemptID: uuid.NewV4().String(),
+ 	}, "1.2.3.4", "test-agent")
+ 	require.ErrorIs(t, err, boom)
+ 
+-	// The usage count increment must have been compensated (reverted back to 0)
++	// The usage count increment must have been compensated (reverted back to 0) by releasing this attempt
+ 	require.Equal(t, 0, signupTokenUsageCount(t, svc, token.ID))
+ }
+ 
++// TestSignUpReplayReturnsExistingUser verifies a retried request with the same attempt ID never creates a second user
++func TestSignUpReplayReturnsExistingUser(t *testing.T) {
++	db := testutils.NewDatabaseForTest(t)
++	svc := newSignupServiceForTest(t, db, dbUserCreator{})
++
++	token, err := svc.CreateSignupToken(t.Context(), time.Hour, 1, nil)
++	require.NoError(t, err)
++
++	attemptID := uuid.NewV4().String()
++	input := signUpDto{
++		Username:  "replayuser",
++		Token:     token.Token,
++		AttemptID: attemptID,
++	}
++	config := appconfig.NewTestConfig(nil)
++
++	user1, accessToken1, err := svc.SignUp(t.Context(), config, input, "1.2.3.4", "test-agent")
++	require.NoError(t, err)
++	require.Equal(t, attemptID, user1.ID)
++	require.Equal(t, "access-token", accessToken1)
++
++	// Replaying the exact same request (for example after a lost response) returns the existing user with a fresh session
++	user2, accessToken2, err := svc.SignUp(t.Context(), config, input, "1.2.3.4", "test-agent")
++	require.NoError(t, err)
++	require.Equal(t, user1.ID, user2.ID)
++	require.Equal(t, "access-token", accessToken2)
++
++	// Exactly one user exists and only one quota slot was ever consumed
++	require.Equal(t, int64(1), countUsersForTest(t, db))
++	require.Equal(t, 1, signupTokenUsageCount(t, svc, token.ID))
++}
++
++// TestSignUpReplayWithMismatchedProfileRejected verifies a replay that knows an attempt ID but not its profile cannot claim the account
++func TestSignUpReplayWithMismatchedProfileRejected(t *testing.T) {
++	db := testutils.NewDatabaseForTest(t)
++	svc := newSignupServiceForTest(t, db, dbUserCreator{})
++
++	token, err := svc.CreateSignupToken(t.Context(), time.Hour, 1, nil)
++	require.NoError(t, err)
++
++	attemptID := uuid.NewV4().String()
++	config := appconfig.NewTestConfig(nil)
++
++	_, _, err = svc.SignUp(t.Context(), config, signUpDto{
++		Username:  "real-owner",
++		Token:     token.Token,
++		AttemptID: attemptID,
++	}, "1.2.3.4", "test-agent")
++	require.NoError(t, err)
++
++	// Reusing the attempt ID with a different profile is a conflict, not a session for the existing user
++	_, _, err = svc.SignUp(t.Context(), config, signUpDto{
++		Username:  "intruder",
++		Token:     token.Token,
++		AttemptID: attemptID,
++	}, "1.2.3.4", "test-agent")
++	require.True(t, apperror.IsCode(err, apperror.CodeAlreadyInUse))
++	require.Equal(t, int64(1), countUsersForTest(t, db))
++	require.Equal(t, 1, signupTokenUsageCount(t, svc, token.ID))
++}
++
++// TestSignUpFailureReleasesOnlyOwnAttempt verifies compensating one failed attempt never frees a concurrent attempt's slot
++func TestSignUpFailureReleasesOnlyOwnAttempt(t *testing.T) {
++	db := testutils.NewDatabaseForTest(t)
++	boom := errors.New("could not create user")
++	svc := newSignupServiceForTest(t, db, fakeUserCreator{err: boom})
++
++	token, err := svc.CreateSignupToken(t.Context(), time.Hour, 3, nil)
++	require.NoError(t, err)
++
++	// Two signups are in flight concurrently
++	_, err = svc.actorService.Invoke(t.Context(), SignupTokenActorType, token.Token, signupTokenMethodConsume, signupTokenConsumeRequest{
++		AttemptID: "attempt-a",
++	})
++	require.NoError(t, err)
++	_, err = svc.actorService.Invoke(t.Context(), SignupTokenActorType, token.Token, signupTokenMethodConsume, signupTokenConsumeRequest{
++		AttemptID: "attempt-b",
++	})
++	require.NoError(t, err)
++	require.Equal(t, 2, signupTokenStateForTest(t, svc, token.Token).UsageCount)
++
++	// Signup A fails: only its slot is returned, B keeps occupying one
++	_, _, err = svc.SignUp(t.Context(), appconfig.NewTestConfig(nil), signUpDto{
++		Username:  "newuser-a",
++		Token:     token.Token,
++		AttemptID: "attempt-a",
++	}, "1.2.3.4", "test-agent")
++	require.ErrorIs(t, err, boom)
++
++	state := signupTokenStateForTest(t, svc, token.Token)
++	require.Equal(t, 1, state.UsageCount)
++	require.Len(t, state.Attempts, 1)
++	require.Equal(t, "attempt-b", state.Attempts[0].ID)
++	require.Equal(t, signupAttemptPending, state.Attempts[0].Status)
++}
++
++// TestSignUpUnknownCommitOutcomeConfirmsUser verifies an error with a committed user completes the attempt instead of creating a duplicate
++func TestSignUpUnknownCommitOutcomeConfirmsUser(t *testing.T) {
++	db := testutils.NewDatabaseForTest(t)
++	svc := newSignupServiceForTest(t, db, fakeUserCreator{err: errors.New("commit result unknown")})
++
++	token, err := svc.CreateSignupToken(t.Context(), time.Hour, 1, nil)
++	require.NoError(t, err)
++
++	attemptID := uuid.NewV4().String()
++
++	// The actor accepted the attempt
++	res, err := svc.actorService.Invoke(t.Context(), SignupTokenActorType, token.Token, signupTokenMethodConsume, signupTokenConsumeRequest{
++		AttemptID: attemptID,
++	})
++	require.NoError(t, err)
++	var consumeRes signupTokenConsumeResponse
++	require.NoError(t, res.Decode(&consumeRes))
++	require.Equal(t, signupTokenConsumeOK, consumeRes.Status)
++
++	// The user actually committed before the failure (uncertain commit result)
++	require.NoError(t, db.Create(&model.User{
++		Base:     model.Base{ID: attemptID},
++		Username: "committed-user",
++	}).Error)
++
++	cause := errors.New("database connection dropped during commit")
++	user, accessToken, err := svc.resolveFailedSignup(t.Context(), appconfig.NewTestConfig(nil), signUpDto{
++		Username:  "committed-user",
++		Token:     token.Token,
++		AttemptID: attemptID,
++	}, attemptID, cause)
++	require.NoError(t, err)
++	require.Equal(t, attemptID, user.ID)
++	require.Equal(t, "access-token", accessToken)
++
++	// The attempt is completed, the slot kept, and no duplicate user exists
++	state := signupTokenStateForTest(t, svc, token.Token)
++	require.Equal(t, 1, state.UsageCount)
++	require.Len(t, state.Attempts, 1)
++	require.Equal(t, signupAttemptCompleted, state.Attempts[0].Status)
++	require.Equal(t, int64(1), countUsersForTest(t, db))
++}
++
++// TestSignUpDuplicateProfileReleasesAttempt verifies a profile conflict frees the failed attempt but keeps a concurrent successful one
++func TestSignUpDuplicateProfileReleasesAttempt(t *testing.T) {
++	db := testutils.NewDatabaseForTest(t)
++	svc := newSignupServiceForTest(t, db, dbUserCreator{})
++
++	token, err := svc.CreateSignupToken(t.Context(), time.Hour, 2, nil)
++	require.NoError(t, err)
++	config := appconfig.NewTestConfig(nil)
++
++	_, _, err = svc.SignUp(t.Context(), config, signUpDto{
++		Username:  "duplicateuser",
++		Token:     token.Token,
++		AttemptID: uuid.NewV4().String(),
++	}, "1.2.3.4", "test-agent")
++	require.NoError(t, err)
++
++	// A second signup with another attempt ID but the same username conflicts and fails
++	_, _, err = svc.SignUp(t.Context(), config, signUpDto{
++		Username:  "duplicateuser",
++		Token:     token.Token,
++		AttemptID: uuid.NewV4().String(),
++	}, "1.2.3.4", "test-agent")
++	require.Error(t, err)
++
++	// The failed attempt's slot was released, leaving only the committed user's
++	require.Equal(t, 1, signupTokenUsageCount(t, svc, token.ID))
++	require.Equal(t, int64(1), countUsersForTest(t, db))
++}
++
++// TestSignUpConcurrentSameAttemptCreatesOneUser verifies request replay and multi-goroutine concurrency create at most one user
++func TestSignUpConcurrentSameAttemptCreatesOneUser(t *testing.T) {
++	db := testutils.NewDatabaseForTest(t)
++	svc := newSignupServiceForTest(t, db, dbUserCreator{})
++
++	token, err := svc.CreateSignupToken(t.Context(), time.Hour, 1, nil)
++	require.NoError(t, err)
++
++	attemptID := uuid.NewV4().String()
++	input := signUpDto{
++		Username:  "raceuser",
++		Token:     token.Token,
++		AttemptID: attemptID,
++	}
++	config := appconfig.NewTestConfig(nil)
++
++	const requestCount = 10
++	var wg sync.WaitGroup
++	errs := make(chan error, requestCount)
++	for range requestCount {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			_, _, err := svc.SignUp(t.Context(), config, input, "1.2.3.4", "test-agent")
++			errs <- err
++		}()
++	}
++	wg.Wait()
++	close(errs)
++
++	for err := range errs {
++		require.NoError(t, err)
++	}
++
++	require.Equal(t, int64(1), countUsersForTest(t, db))
++	require.Equal(t, 1, signupTokenUsageCount(t, svc, token.ID))
++	state := signupTokenStateForTest(t, svc, token.Token)
++	require.Len(t, state.Attempts, 1)
++	require.Equal(t, signupAttemptCompleted, state.Attempts[0].Status)
++}
++
++// TestRecoverPendingAttempts verifies the startup sweep confirms committed users and releases abandoned slots without touching young attempts
++func TestRecoverPendingAttempts(t *testing.T) {
++	db := testutils.NewDatabaseForTest(t)
++	svc := newSignupServiceForTest(t, db, dbUserCreator{})
++
++	now := time.Now()
++	abandonedID := uuid.NewV4().String()
++	committedPendingID := uuid.NewV4().String()
++	youngPendingID := uuid.NewV4().String()
++	youngOnlyID := uuid.NewV4().String()
++
++	state := SignupTokenState{
++		ID:         "token-recovery-id",
++		ExpiresAt:  now.Add(time.Hour),
++		UsageLimit: 3,
++		UsageCount: 3,
++		CreatedAt:  now,
++		Attempts: []signupTokenAttempt{
++			{ID: committedPendingID, Status: signupAttemptPending, CreatedAt: now.Add(-10 * time.Minute)},
++			{ID: youngPendingID, Status: signupAttemptPending, CreatedAt: now},
++			{ID: abandonedID, Status: signupAttemptPending, CreatedAt: now.Add(-10 * time.Minute)},
++		},
++	}
++	_, err := svc.actorService.Invoke(t.Context(), SignupTokenActorType, "token-recovery", SignupTokenMethodCreate, state)
++	require.NoError(t, err)
++
++	// Only the old attempt that actually committed a user has a row in the database
++	require.NoError(t, db.Create(&model.User{Base: model.Base{ID: committedPendingID}, Username: "committed-pending"}).Error)
++
++	// A second token with a single young, userless attempt must be left untouched for its delayed job
++	youngOnlyState := SignupTokenState{
++		ID:         "token-young-id",
++		ExpiresAt:  now.Add(time.Hour),
++		UsageLimit: 1,
++		UsageCount: 1,
++		CreatedAt:  now,
++		Attempts:   []signupTokenAttempt{{ID: youngOnlyID, Status: signupAttemptPending, CreatedAt: now}},
++	}
++	_, err = svc.actorService.Invoke(t.Context(), SignupTokenActorType, "token-young", SignupTokenMethodCreate, youngOnlyState)
++	require.NoError(t, err)
++
++	require.NoError(t, svc.recoverPendingAttempts(t.Context()))
++
++	recovered := signupTokenStateForTest(t, svc, "token-recovery")
++	require.Equal(t, 2, recovered.UsageCount)
++	require.Equal(t, signupAttemptCompleted, findSignupAttempt(recovered.Attempts, committedPendingID).Status)
++	require.NotNil(t, findSignupAttempt(recovered.Attempts, youngPendingID))
++	require.Nil(t, findSignupAttempt(recovered.Attempts, abandonedID))
++
++	youngOnly := signupTokenStateForTest(t, svc, "token-young")
++	require.Equal(t, 1, youngOnly.UsageCount)
++	require.Len(t, youngOnly.Attempts, 1)
++	require.Equal(t, signupAttemptPending, youngOnly.Attempts[0].Status)
++}
++
++func TestMapSignupActorUnavailable(t *testing.T) {
++	require.True(t, apperror.IsCode(mapSignupActorUnavailable(actor.ErrNoHost), apperror.CodeSignupTemporarilyUnavailable))
++	require.True(t, apperror.IsCode(mapSignupActorUnavailable(actor.ErrActorHalted), apperror.CodeSignupTemporarilyUnavailable))
++	require.True(t, apperror.IsCode(mapSignupActorUnavailable(context.DeadlineExceeded), apperror.CodeSignupTemporarilyUnavailable))
++	// A lost response after the actor may have executed is retryable with the same attempt ID
++	require.True(t, apperror.IsCode(
++		mapSignupActorUnavailable(fmt.Errorf("invoke failed: %w", protocol.NewError(protocol.ErrCodeTransportFailure, "response lost"))),
++		apperror.CodeSignupTemporarilyUnavailable,
++	))
++	require.True(t, apperror.IsCode(mapSignupActorUnavailable(errors.New("boom")), apperror.CodeInternal))
++}
++
+ func TestSignUpRejectsInvalidToken(t *testing.T) {
+ 	db := testutils.NewDatabaseForTest(t)
+ 	svc := newSignupServiceForTest(t, db, fakeUserCreator{user: model.User{Base: model.Base{ID: "new-user"}}})
+ 
+ 	config := appconfig.NewTestConfig(nil)
+ 	_, _, err := svc.SignUp(t.Context(), config, signUpDto{
+-		Username: "newuser",
+-		Token:    "not-a-real-token",
++		Username:  "newuser",
++		Token:     "not-a-real-token",
++		AttemptID: uuid.NewV4().String(),
+ 	}, "1.2.3.4", "test-agent")
+ 
+ 	require.True(t, apperror.IsCode(err, apperror.CodeTokenInvalidOrExpired))
+diff --git a/frontend/src/lib/types/user.type.ts b/frontend/src/lib/types/user.type.ts
+index 4ea52ec4..20180653 100644
+--- a/frontend/src/lib/types/user.type.ts
++++ b/frontend/src/lib/types/user.type.ts
+@@ -27,4 +27,6 @@ export type UserSignUp = Omit<
+ 	'isAdmin' | 'disabled' | 'displayName' | 'emailVerified'
+ > & {
+ 	token?: string;
++	// Stable identifier of one registration attempt, reused across retries so the backend never creates a duplicate account
++	attemptId?: string;
+ };
+diff --git a/frontend/src/routes/signup/+page.svelte b/frontend/src/routes/signup/+page.svelte
+index 1e7f32b3..8fc289ca 100644
+--- a/frontend/src/routes/signup/+page.svelte
++++ b/frontend/src/routes/signup/+page.svelte
+@@ -20,8 +20,18 @@
+ 
+ 	let error: string | undefined = $state();
+ 
++	// One stable attempt ID per page visit, reused across retries of the same submission so a lost response never creates a second account
++	let signupAttemptId = $state(crypto.randomUUID());
++
+ 	async function handleSignup(userData: UserSignUp) {
+-		const result = await tryCatch(userService.signup({ ...userData, token: data.token }));
++		// The attempt ID only matters for token signups, where the backend ties it to the token's quota slot
++		const result = await tryCatch(
++			userService.signup({
++				...userData,
++				token: data.token,
++				...(data.token ? { attemptId: signupAttemptId } : {})
++			})
++		);
+ 
+ 		if (result.error) {
+ 			error = getAxiosErrorMessage(result.error);

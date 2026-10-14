@@ -6,7 +6,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/italypaleale/francis/actor"
 	francishost "github.com/italypaleale/francis/host"
+	"github.com/italypaleale/francis/host/local"
 	"gorm.io/gorm"
 
 	"github.com/pocket-id/pocket-id/backend/internal/appconfig"
@@ -51,27 +53,40 @@ type Module struct {
 }
 
 func New(deps Dependencies) (*Module, error) {
+	service := newService(deps, deps.Actors.Service())
+
 	// Register the actor that manages a signup token
 	// Each token is its own actor, whose actor ID is the token's value
-	err := deps.Actors.RegisterActor(SignupTokenActorType, NewSignupTokenActor)
+	// The factory closure gives the actor the service as its AttemptReconciler for crash recovery jobs
+	err := deps.Actors.RegisterActor(SignupTokenActorType,
+		func(actorID string, actorService *actor.Service) actor.Actor {
+			return NewSignupTokenActorWithReconciler(actorID, actorService, service)
+		},
+		local.WithMaxAttempts(attemptReconcileMaxAttempts),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("error registering the %s actor: %w", SignupTokenActorType, err)
 	}
 
-	service := newService(deps, deps.Actors.Service())
 	return &Module{
 		service: service,
 		handler: newHandler(service, deps.AppConfig),
 	}, nil
 }
 
-// RunSignupTokenMigration performs the one-time migration of the pre-actor signup tokens, then blocks until the context is canceled.
-// It's meant to be started as a background service gated on the actor host being ready, since the migration needs the actor state store.
+// RunSignupTokenMigration performs the one-time migration of the pre-actor signup tokens and recovers pending attempts, then blocks until the context is canceled.
+// It's meant to be started as a background service gated on the actor host being ready, since both steps need the actor state store.
 // Note that it must not return before the context is canceled, as the service runner stops the application as soon as any of its services returns.
 func (m *Module) RunSignupTokenMigration(ctx context.Context) error {
 	err := m.service.migrateSignupTokens(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to migrate signup tokens: %w", err)
+	}
+
+	// Reconcile attempts left pending by a process that died after reserving the slot but before reporting the outcome
+	err = m.service.recoverPendingAttempts(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to recover pending signup attempts: %w", err)
 	}
 
 	<-ctx.Done()

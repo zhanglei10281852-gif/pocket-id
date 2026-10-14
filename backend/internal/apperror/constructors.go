@@ -260,6 +260,10 @@ func OpenSignupDisabled() *Error {
 	return New(CodeOpenSignupDisabled, http.StatusForbidden, "Open user signup is not enabled")
 }
 
+func SignupTemporarilyUnavailable() *Error {
+	return New(CodeSignupTemporarilyUnavailable, http.StatusServiceUnavailable, "Signup is temporarily unavailable, please try again")
+}
+
 func ClientIDAlreadyExists() *Error {
 	return New(CodeClientIDAlreadyExists, http.StatusConflict, "Client ID is already in use")
 }

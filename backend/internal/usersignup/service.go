@@ -2,6 +2,7 @@ package usersignup
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -10,6 +11,7 @@ import (
 	"uuid"
 
 	"github.com/italypaleale/francis/actor"
+	"github.com/italypaleale/francis/protocol"
 	"gorm.io/gorm"
 
 	"github.com/pocket-id/pocket-id/backend/internal/appconfig"
@@ -53,13 +55,22 @@ func (s *Service) SignUp(ctx context.Context, config *appconfig.AppConfigModel, 
 		return model.User{}, "", apperror.OpenSignupDisabled()
 	}
 
+	// The attempt ID identifies this registration across retries and doubles as the new user's ID, so every replay lands on the same users row
+	attemptID := signupData.AttemptID
+
 	var userGroupIDs []string
 	if tokenProvided {
-		// Consume the signup token by invoking its actor: this atomically validates it and increments its usage count
+		if attemptID == "" {
+			attemptID = uuid.NewV4().String()
+		}
+
+		// Consume the signup token by invoking its actor: this atomically validates it and reserves one quota slot for this exact attempt
 		// Note: must invoke outside of a DB transaction, since invoking an actor while a transaction is open would deadlock on SQLite
-		res, err := s.actorService.Invoke(ctx, SignupTokenActorType, signupData.Token, signupTokenMethodConsume, nil)
+		res, err := s.actorService.Invoke(ctx, SignupTokenActorType, signupData.Token, signupTokenMethodConsume, signupTokenConsumeRequest{
+			AttemptID: attemptID,
+		})
 		if err != nil {
-			return model.User{}, "", fmt.Errorf("error invoking signup token actor: %w", err)
+			return model.User{}, "", mapSignupActorUnavailable(fmt.Errorf("error invoking signup token actor: %w", err))
 		}
 
 		var consumeRes signupTokenConsumeResponse
@@ -68,6 +79,7 @@ func (s *Service) SignUp(ctx context.Context, config *appconfig.AppConfigModel, 
 			return model.User{}, "", fmt.Errorf("error decoding signup token actor response: %w", err)
 		}
 
+		// not_found (expired or deleted token) and limit_reached share the public response but stay distinct statuses internally
 		if consumeRes.Status != signupTokenConsumeOK {
 			return model.User{}, "", apperror.TokenInvalidOrExpired()
 		}
@@ -83,18 +95,130 @@ func (s *Service) SignUp(ctx context.Context, config *appconfig.AppConfigModel, 
 		UserGroupIds:  userGroupIDs,
 		EmailVerified: config.EmailsVerified.IsTrue(),
 	}
+	// The attempt ID only ties token signups to their quota slot; open signups keep server-generated user IDs
+	if tokenProvided {
+		userToCreate.ID = attemptID
+	}
 
-	// The token has now been consumed
-	// From this point on, if we hit an error we compensate by releasing the token (best-effort)
-	user, accessToken, err := s.createSignedUpUser(ctx, config, userToCreate, signupData.Token, tokenProvided, ipAddress, userAgent)
-	if err != nil {
-		if tokenProvided {
-			s.releaseSignupToken(ctx, signupData.Token)
+	// A replay whose user was already committed must not create another account: confirm the attempt and return the existing user
+	if tokenProvided {
+		existing, found, err := s.findCommittedUser(ctx, attemptID)
+		if err != nil {
+			// With the database unreadable we cannot tell whether a user exists, so leave the attempt pending for durable reconciliation
+			return model.User{}, "", err
 		}
+		if found {
+			// Only the request with the attempt's original profile may claim its session, so a guessed attempt ID can't mint a token for someone else
+			if conflictField, matches := replayProfileMatch(signupData, existing); !matches {
+				s.markAttemptCompleted(ctx, signupData.Token, attemptID)
+				return model.User{}, "", apperror.AlreadyInUse(conflictField)
+			}
+			return s.finishReplayedSignup(ctx, config, signupData.Token, existing)
+		}
+	}
+
+	// From here on the attempt is pending: create the user, issue the token, and write the audit log in one transaction
+	user, accessToken, err := s.createSignedUpUser(ctx, config, userToCreate, signupData.Token, tokenProvided, ipAddress, userAgent)
+	if err == nil {
+		if tokenProvided {
+			s.markAttemptCompleted(ctx, signupData.Token, attemptID)
+		}
+		return user, accessToken, nil
+	}
+
+	if !tokenProvided {
 		return model.User{}, "", err
 	}
 
+	// The request failed: decide the attempt's fate from what actually landed in the database instead of blindly freeing a slot
+	return s.resolveFailedSignup(ctx, config, signupData, attemptID, err)
+}
+
+// replayProfileMatch checks whether a replay request carries the same unique profile the attempt created.
+// It returns the conflicting field name when the request must not be treated as that attempt's replay.
+func replayProfileMatch(signupData signUpDto, user model.User) (string, bool) {
+	if !strings.EqualFold(user.Username, signupData.Username) {
+		return "username", false
+	}
+
+	email := ""
+	if signupData.Email != nil {
+		email = *signupData.Email
+	}
+	userEmail := ""
+	if user.Email != nil {
+		userEmail = *user.Email
+	}
+	if !strings.EqualFold(userEmail, email) {
+		return "email", false
+	}
+
+	return "", true
+}
+
+// finishReplayedSignup completes an attempt whose user already exists and returns a fresh session for that user.
+// The audit log was written by the original committing request, so it isn't written again; the SCIM schedule is idempotent.
+func (s *Service) finishReplayedSignup(ctx context.Context, config *appconfig.AppConfigModel, token string, user model.User) (model.User, string, error) {
+	s.markAttemptCompleted(ctx, token, user.ID)
+
+	accessToken, err := s.signer.GenerateAccessToken(user, "", config.SessionDuration.AsDurationMinutes())
+	if err != nil {
+		return model.User{}, "", err
+	}
+
+	s.scheduleScimSync(ctx)
 	return user, accessToken, nil
+}
+
+// resolveFailedSignup reconciles an attempt after its request returned an error.
+// A committed user wins: the attempt is completed and the signup is recovered as success.
+// Without a user the transaction rolled back, so only this attempt's slot is released.
+func (s *Service) resolveFailedSignup(ctx context.Context, config *appconfig.AppConfigModel, signupData signUpDto, attemptID string, cause error) (model.User, string, error) {
+	user, found, lookupErr := s.findCommittedUser(ctx, attemptID)
+	if lookupErr != nil {
+		// Whether the transaction committed is now undecidable: leave the attempt pending and let durable reconciliation resolve it after re-checking the database
+		slog.ErrorContext(ctx, "Unable to determine whether the signup transaction committed; leaving the attempt pending for reconciliation",
+			slog.String("attemptId", attemptID),
+			slog.Any("signupError", cause),
+			slog.Any("lookupError", lookupErr))
+		return model.User{}, "", cause
+	}
+
+	if !found {
+		s.releaseSignupAttempt(ctx, signupData.Token, attemptID)
+		return model.User{}, "", cause
+	}
+
+	// A committed user with a different profile isn't this request's account: keep the attempt completed but don't hand over a session
+	if conflictField, matches := replayProfileMatch(signupData, user); !matches {
+		s.markAttemptCompleted(ctx, signupData.Token, attemptID)
+		return model.User{}, "", apperror.AlreadyInUse(conflictField)
+	}
+
+	// The user was committed despite the error (an uncertain commit result, or a lost race with a concurrent replay): confirm rather than duplicate
+	s.markAttemptCompleted(ctx, signupData.Token, attemptID)
+
+	accessToken, err := s.signer.GenerateAccessToken(user, "", config.SessionDuration.AsDurationMinutes())
+	if err != nil {
+		return model.User{}, "", err
+	}
+
+	s.scheduleScimSync(ctx)
+	return user, accessToken, nil
+}
+
+// findCommittedUser looks up a user by the attempt ID outside any signup transaction.
+func (s *Service) findCommittedUser(ctx context.Context, attemptID string) (model.User, bool, error) {
+	var user model.User
+	err := s.db.WithContext(ctx).Where("id = ?", attemptID).First(&user).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return model.User{}, false, nil
+	}
+	if err != nil {
+		return model.User{}, false, fmt.Errorf("error looking up the user of signup attempt '%s': %w", attemptID, err)
+	}
+
+	return user, true, nil
 }
 
 // createSignedUpUser creates the user and issues an access token within a single transaction.
@@ -127,26 +251,188 @@ func (s *Service) createSignedUpUser(ctx context.Context, config *appconfig.AppC
 
 	err = tx.Commit().Error
 	if err != nil {
-		return model.User{}, "", err
-	}
-	if s.scimSync != nil {
-		s.scimSync.ScheduleSync(ctx)
+		// A commit error is ambiguous (the transaction may have landed): the caller verifies the outcome against the database
+		return model.User{}, "", fmt.Errorf("error committing the new user transaction: %w", err)
 	}
 
+	s.scheduleScimSync(ctx)
 	return user, accessToken, nil
 }
 
-// releaseSignupToken reverts the usage count increment performed while consuming a token, used to compensate when the signup could not be completed.
-// It's a best-effort compensation: if it fails (or the process crashes before it runs) we accept that a token use was consumed unnecessarily
-func (s *Service) releaseSignupToken(parentCtx context.Context, token string) {
-	// Use a context that is not canceled when the original request ends
+// markAttemptCompleted tells the actor that the attempt's user is committed, so its slot stays occupied.
+// It's best-effort: if the actor is unreachable, the durable reconciliation job confirms the attempt after seeing the user.
+func (s *Service) markAttemptCompleted(parentCtx context.Context, token, attemptID string) {
+	err := s.invokeSignupTokenActor(parentCtx, token, signupTokenMethodComplete, signupTokenAttemptRequest{
+		AttemptID: attemptID,
+	})
+	if err != nil {
+		slog.ErrorContext(parentCtx, "Failed to mark a signup attempt completed; reconciliation will confirm it",
+			slog.String("attemptId", attemptID),
+			slog.Any("error", err))
+	}
+}
+
+// releaseSignupAttempt frees the slot belonging to one specific attempt, used to compensate when the signup could not commit a user.
+// It's best-effort: if the actor is unreachable, the durable reconciliation job releases the attempt once the database shows no user for it.
+func (s *Service) releaseSignupAttempt(parentCtx context.Context, token, attemptID string) {
+	err := s.invokeSignupTokenActor(parentCtx, token, signupTokenMethodRelease, signupTokenAttemptRequest{
+		AttemptID: attemptID,
+	})
+	if err != nil {
+		slog.ErrorContext(parentCtx, "Failed to release a signup attempt after a failed signup; reconciliation will release it",
+			slog.String("attemptId", attemptID),
+			slog.Any("error", err))
+	}
+}
+
+// invokeSignupTokenActor invokes one method of a signup token actor with a context that survives the request's cancellation.
+func (s *Service) invokeSignupTokenActor(parentCtx context.Context, token, method string, payload any) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parentCtx), 10*time.Second)
 	defer cancel()
 
-	_, err := s.actorService.Invoke(ctx, SignupTokenActorType, token, signupTokenMethodRelease, nil)
+	_, err := s.actorService.Invoke(ctx, SignupTokenActorType, token, method, payload)
 	if err != nil {
-		slog.ErrorContext(ctx, "Failed to release signup token after a failed signup", slog.Any("error", err))
+		return fmt.Errorf("error invoking signup token actor method '%s': %w", method, err)
 	}
+
+	return nil
+}
+
+// scheduleScimSync requests a SCIM synchronization after a user change has committed.
+// Scheduling replaces a single debounced alarm, so replaying a signup never duplicates the side effect.
+func (s *Service) scheduleScimSync(ctx context.Context) {
+	if s.scimSync != nil {
+		s.scimSync.ScheduleSync(ctx)
+	}
+}
+
+// UserExistsForAttempt implements AttemptReconciler for recovery jobs
+func (s *Service) UserExistsForAttempt(ctx context.Context, attemptID string) (bool, error) {
+	_, found, err := s.findCommittedUser(ctx, attemptID)
+	return found, err
+}
+
+// AttemptConfirmed implements AttemptReconciler and restores the post-commit side effect a crashed request may have missed
+func (s *Service) AttemptConfirmed(ctx context.Context, attemptID string) {
+	slog.InfoContext(ctx, "Recovered a signup attempt whose user was already committed",
+		slog.String("attemptId", attemptID))
+	s.scheduleScimSync(ctx)
+}
+
+// mapSignupActorUnavailable turns transient actor-routing failures into a distinct, retryable client error while keeping other failures as internal errors.
+// Retrying with the same attempt ID is always safe: the actor either never accepted the use or returns the existing attempt.
+func mapSignupActorUnavailable(err error) error {
+	retryableProtocolCodes := []protocol.ErrorCode{
+		protocol.ErrCodeTransportFailure,
+		protocol.ErrCodeRetryLater,
+		protocol.ErrCodeOverloaded,
+		protocol.ErrCodeHostDraining,
+		protocol.ErrCodeDeadlineExceeded,
+		protocol.ErrCodeNoHost,
+		protocol.ErrCodeSessionSuperseded,
+	}
+	for _, code := range retryableProtocolCodes {
+		if errors.Is(err, protocol.NewError(code, "")) {
+			return apperror.SignupTemporarilyUnavailable()
+		}
+	}
+
+	switch {
+	case errors.Is(err, actor.ErrNoHost),
+		errors.Is(err, actor.ErrActorHalted),
+		errors.Is(err, actor.ErrActorNotHosted),
+		errors.Is(err, actor.ErrActorTypeUnsupported),
+		errors.Is(err, context.DeadlineExceeded):
+		return apperror.SignupTemporarilyUnavailable()
+	default:
+		return apperror.Internal(err)
+	}
+}
+
+// recoverPendingAttempts reconciles every pending attempt after a restart, covering attempts whose durable job was lost with the process.
+// Young attempts are skipped: another replica may still be serving their request, and the delayed job handles them.
+func (s *Service) recoverPendingAttempts(ctx context.Context) error {
+	entries, err := s.listSignupTokenStates(ctx)
+	if err != nil {
+		return err
+	}
+
+	// Collect every pending attempt so user lookups can run in one batch
+	pendingByToken := make(map[string][]signupTokenAttempt)
+	pendingIDs := make([]string, 0)
+	for _, e := range entries {
+		for _, a := range e.State.Attempts {
+			if a.Status != signupAttemptPending {
+				continue
+			}
+			pendingByToken[e.Token] = append(pendingByToken[e.Token], a)
+			pendingIDs = append(pendingIDs, a.ID)
+		}
+	}
+	if len(pendingIDs) == 0 {
+		return nil
+	}
+
+	existingUsers, err := s.lookupExistingAttemptUsers(ctx, pendingIDs)
+	if err != nil {
+		return err
+	}
+
+	var recovered, released int
+	for token, attempts := range pendingByToken {
+		for _, a := range attempts {
+			res, err := s.actorService.Invoke(ctx, SignupTokenActorType, token, signupTokenMethodReconcile, signupTokenReconcileRequest{
+				AttemptID:  a.ID,
+				UserExists: existingUsers[a.ID],
+			})
+			if err != nil {
+				return fmt.Errorf("error reconciling signup attempt '%s' on token '%s': %w", a.ID, token, err)
+			}
+
+			var reconcileRes signupTokenReconcileResponse
+			err = res.Decode(&reconcileRes)
+			if err != nil {
+				return fmt.Errorf("error decoding reconciliation response for attempt '%s': %w", a.ID, err)
+			}
+
+			switch reconcileRes.Status {
+			case signupTokenReconcileCompleted:
+				recovered++
+				s.AttemptConfirmed(ctx, a.ID)
+			case signupTokenReconcileReleased:
+				released++
+			case signupTokenReconcileDeferred, signupTokenReconcileNoop:
+				// Young attempts wait for their delayed job, and resolved attempts need no action
+			}
+		}
+	}
+
+	if recovered > 0 || released > 0 {
+		slog.InfoContext(ctx, "Recovered pending signup attempts after startup",
+			slog.Int("confirmed", recovered),
+			slog.Int("released", released))
+	}
+
+	return nil
+}
+
+// lookupExistingAttemptUsers returns which of the given attempt IDs already have a committed user.
+func (s *Service) lookupExistingAttemptUsers(ctx context.Context, attemptIDs []string) (map[string]bool, error) {
+	var foundIDs []string
+	err := s.db.WithContext(ctx).
+		Model(&model.User{}).
+		Where("id IN ?", attemptIDs).
+		Pluck("id", &foundIDs).
+		Error
+	if err != nil {
+		return nil, fmt.Errorf("error looking up users for pending signup attempts: %w", err)
+	}
+
+	existing := make(map[string]bool, len(foundIDs))
+	for _, id := range foundIDs {
+		existing[id] = true
+	}
+	return existing, nil
 }
 
 func (s *Service) SignUpInitialAdmin(ctx context.Context, config *appconfig.AppConfigModel, signUpData signUpDto) (model.User, string, error) {
@@ -195,9 +481,7 @@ func (s *Service) SignUpInitialAdmin(ctx context.Context, config *appconfig.AppC
 	if err != nil {
 		return model.User{}, "", err
 	}
-	if s.scimSync != nil {
-		s.scimSync.ScheduleSync(ctx)
-	}
+	s.scheduleScimSync(ctx)
 
 	return user, token, nil
 }
@@ -490,7 +774,7 @@ func sortSignupTokens(tokens []SignupToken, column, direction string) {
 	case "createdAt", "":
 		// Use the default comparator (creation date)
 	default:
-		// Unknown or non-sortable column: keep the default (creation date) ordering
+		// Unknown or non-sortable column: keep the default (creation date)
 	}
 
 	sort.SliceStable(tokens, func(i, j int) bool {

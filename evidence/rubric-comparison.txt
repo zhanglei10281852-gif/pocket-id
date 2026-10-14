@@ -1,0 +1,11 @@
+项目：pocket-id / signup token attempt recovery
+题目：pocket-id-pocket-id-6f4ff62d-1fd6-4f80-988d-084b4c2749ab｜Session：6ace49533b24daed587d7755｜基线：80a504b454f273efea6b692857f1ceb6a34b2e7f
+验证：go test -count=1 -tags=exclude_frontend,unit ./... 通过；usersignup 关键并发与恢复用例 -count=5 通过。
+Rubric ID：1｜状态：通过｜期望行为：actor 持久记录稳定唯一尝试且重放不重复占位。｜实际观察：consume 先按 AttemptID 查台账，命中 pending 或 completed 均返回 Replayed，只有新 ID 才追加 pending 并增加 UsageCount。｜直接证据：backend/internal/usersignup/actor.go:238-282；TestSignUpConcurrentSameAttemptCreatesOneUser 重复五次通过。
+Rubric ID：2｜状态：通过｜期望行为：尝试与最终用户建立可恢复的一对一关联。｜实际观察：token signup 把 AttemptID 写入 UserCreateDto.ID，完成与重启恢复均按该用户主键确认 completed。｜直接证据：backend/internal/usersignup/service.go:58-125、310-435；TestRecoverPendingAttempts 通过。
+Rubric ID：3｜状态：通过｜期望行为：回滚或提交前崩溃只归还失败尝试的名额。｜实际观察：release 必须匹配指定 pending AttemptID，删除该台账项后只递减一次 UsageCount，其他尝试不变。｜直接证据：backend/internal/usersignup/actor.go:328-358；TestSignUpFailureReleasesOnlyOwnAttempt 重复五次通过。
+Rubric ID：4｜状态：通过｜期望行为：用户已提交而 actor 未完成时恢复确认原尝试且不重复副作用。｜实际观察：恢复按用户主键将 pending 改为 completed；审计与用户同事务提交，重放不再写审计，SCIM 使用集群级防抖调度。｜直接证据：backend/internal/usersignup/actor.go:398-405、462-465；service.go:159-207、242-259；scimsync/module.go:61-70。
+Rubric ID：5｜状态：未通过｜期望行为：不同失败状态采取可诊断恢复且未完成尝试不会永久占用。｜实际观察：consume 在持久增加 UsageCount 后才 Dispatch；Dispatch 失败直接返回错误。进程在两分钟内重启时 recoverPendingAttempts 对无用户的年轻尝试得到 deferred，且没有重新 Dispatch。｜直接证据：backend/internal/usersignup/actor.go:261-276、408-422；service.go:352-406。｜原因：占位写入成功后 Dispatch 失败且进程在两分钟内重启时，年轻 pending 尝试无持久任务也无重新调度，名额没有后续释放触发｜影响：该 signup token 的 UsageCount 永久保留失败占位，有限配额可被耗尽｜证据位置：backend/internal/usersignup/actor.go:268-276；backend/internal/usersignup/service.go:398-405
+Rubric ID：6｜状态：通过｜期望行为：正常 token signup 保持默认组、claims、访问令牌、审计与提交后 SCIM 顺序。｜实际观察：既有 CreateUserInternal 仍在事务内应用组和 claims，随后签发访问令牌、写审计、提交，提交后调度 SCIM。｜直接证据：backend/internal/usersignup/service.go:224-259；backend/internal/service/user_service.go:307-381；全量后端测试通过。
+Rubric ID：7｜状态：通过｜期望行为：开放注册、初始管理员、TTL、限制、列表与撤销保持兼容。｜实际观察：AttemptID 仅用于带 token 注册；初始管理员仍用独立事务；actor state TTL、列表过滤和 delete 路径保持，过期或删除状态不会由 complete/reconcile 重建。｜直接证据：backend/internal/usersignup/service.go:51-101、438-557；actor.go:300-302、389-395、486-529；全量后端测试通过。
+结论：部分完成｜收录：长程题｜实际时长：18971 秒｜是否严格大于两小时：是
