@@ -101,6 +101,14 @@ func initServices(
 		return nil, fmt.Errorf("failed to create JWT service: %w", err)
 	}
 
+	// Register the daily job that deletes retired OIDC signing keys once their compatibility window has elapsed
+	if !common.EnvConfig.AppEnv.IsTest() {
+		err = registerRetiredSigningKeysCleanup(actors, svc.jwtService)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	svc.auditLogsModule, err = auditlogs.New(auditlogs.Dependencies{
 		Signer:        svc.jwtService,
 		AppURL:        common.EnvConfig.AppURL,

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 	"time"
 	"uuid"
 
@@ -52,18 +53,34 @@ const (
 
 	// Acceptable clock skew for verifying tokens
 	clockSkew = time.Minute
+
+	// signingKeyReloadInterval is how often a running instance picks up rotations performed by the key-rotate command or another instance
+	signingKeyReloadInterval = 30 * time.Second
 )
+
+// signingKeyState is an immutable snapshot of everything token signing and verification need
+// It is replaced atomically when the persistent signing key set changes, so requests never observe a half-switched key
+type signingKeyState struct {
+	// activePrivate is the private key of the active generation and signs new tokens
+	activePrivate jwk.Key
+	// keyID is the kid of the active generation
+	keyID string
+	// alg is the algorithm of the active generation
+	alg jwa.KeyAlgorithm
+	// jwksEncoded is the published JWKS: the active public key plus every retired key still within its compatibility window
+	jwksEncoded []byte
+	// publicKeys is the same set as jwksEncoded in programmatic form, used to verify tokens by kid
+	publicKeys jwk.Set
+}
 
 type JwtService struct {
 	db        *gorm.DB
 	envConfig *common.EnvConfigSchema
-	// privateKey signs tokens that are consumed externally, such as ID tokens and access tokens for apps
-	privateKey jwk.Key
+	// state is the active signing generation plus every still-published retired generation
+	state atomic.Pointer[signingKeyState]
 	// sessionKey is the symmetric key that signs Pocket ID's own session tokens
-	sessionKey  jwk.Key
-	keyId       string
-	instanceID  string
-	jwksEncoded []byte
+	sessionKey jwk.Key
+	instanceID string
 }
 
 func NewJwtService(ctx context.Context, db *gorm.DB, instanceID string) (*JwtService, error) {
@@ -88,13 +105,13 @@ func (s *JwtService) init(ctx context.Context, db *gorm.DB, instanceID string, e
 
 // LoadOrGenerateKey loads the signing keys from the database, generating and persisting them if they don't exist yet
 func (s *JwtService) LoadOrGenerateKey(ctx context.Context) error {
-	// Load the key used for tokens that are consumed externally, such as ID tokens and access tokens for apps
-	err := retryKeyStorage(ctx, s.loadOrGenerateSigningKey)
+	// Load the persistent set used for tokens that are consumed externally, such as ID tokens and access tokens for apps
+	err := retryKeyStorage(ctx, s.loadOrGenerateSigningKeySet)
 	if err != nil {
 		return fmt.Errorf("error loading signing key: %w", err)
 	}
 
-	// Load the key used for Pocket ID's own sessions, which is symmetric
+	// Load the key used for Pocket ID's own sessions, which is symmetric and lives in its own kv row
 	err = retryKeyStorage(ctx, s.loadOrGenerateSessionKey)
 	if err != nil {
 		return fmt.Errorf("error loading session key: %w", err)
@@ -125,41 +142,13 @@ func retryKeyStorage(ctx context.Context, loadOrGenerate func(context.Context) e
 	}
 }
 
-func (s *JwtService) loadOrGenerateSigningKey(ctx context.Context) error {
-	// Get the key provider
-	keyProvider, err := jwkutils.GetKeyProvider(s.db, s.envConfig, s.instanceID)
+// loadOrGenerateSigningKeySet loads the persistent generation set, adopting the legacy single key or generating the first one
+func (s *JwtService) loadOrGenerateSigningKeySet(ctx context.Context) error {
+	loaded, err := jwkutils.EnsureSigningKeySet(ctx, s.db, s.envConfig, s.instanceID, time.Now())
 	if err != nil {
-		return fmt.Errorf("failed to get key provider: %w", err)
+		return err
 	}
-
-	// Try loading a key
-	key, err := keyProvider.LoadKey(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to load key: %w", err)
-	}
-
-	// If we have a key, store it in the object and we're done
-	if key != nil {
-		err = s.SetKey(key)
-		if err != nil {
-			return fmt.Errorf("failed to set private key: %w", err)
-		}
-		return nil
-	}
-
-	// If we are here, we need to generate a new key
-	err = s.generateKey()
-	if err != nil {
-		return fmt.Errorf("failed to generate key: %w", err)
-	}
-
-	// Save the newly-generated key
-	err = keyProvider.SaveKey(ctx, s.privateKey)
-	if err != nil {
-		return fmt.Errorf("failed to save private key: %w", err)
-	}
-
-	return nil
+	return s.applySigningKeySet(loaded, time.Now())
 }
 
 func (s *JwtService) loadOrGenerateSessionKey(ctx context.Context) error {
@@ -205,21 +194,106 @@ func (s *JwtService) loadOrGenerateSessionKey(ctx context.Context) error {
 	return nil
 }
 
-// generateKey generates a new key and stores it in the object
-func (s *JwtService) generateKey() error {
-	// Default is to generate RS256 (RSA-2048) keys
-	key, err := jwkutils.GenerateKey(jwa.RS256().String(), "")
-	if err != nil {
-		return fmt.Errorf("failed to generate new private key: %w", err)
+// applySigningKeySet builds an immutable snapshot from a decrypted persistent set and swaps it in atomically
+// Retired generations past their retain-until deadline are kept for local verification only after the cleanup job removes them; here they are simply not published
+func (s *JwtService) applySigningKeySet(loaded *jwkutils.LoadedSigningKeySet, now time.Time) error {
+	activeKey, activeGen := loaded.ActiveKey()
+	if activeKey == nil {
+		return errors.New("persisted signing key set has no active generation")
+	}
+	if err := ValidateKey(activeKey); err != nil {
+		return fmt.Errorf("active signing key is not valid: %w", err)
 	}
 
-	// Set the key in the object, which also validates it
-	err = s.SetKey(key)
-	if err != nil {
-		return fmt.Errorf("failed to set private key: %w", err)
+	alg, ok := activeKey.Algorithm()
+	if !ok || alg == nil {
+		return errors.New("active signing key has no algorithm")
 	}
 
+	// Public keys are published with the active generation first, then the still-valid retired generations
+	publicSet := jwk.NewSet()
+	added := make(map[string]struct{}, len(loaded.Set.Generations))
+
+	activePublic, err := publicJWK(activeKey)
+	if err != nil {
+		return err
+	}
+	if err := publicSet.AddKey(activePublic); err != nil {
+		return fmt.Errorf("failed to add active public key to JWKS: %w", err)
+	}
+	added[activeGen.Kid] = struct{}{}
+
+	for _, gen := range orderedRetiredGenerations(loaded.Set, now) {
+		privateKey, ok := loaded.Keys[gen.Kid]
+		if !ok {
+			return fmt.Errorf("private key for retired generation %q is not available", gen.Kid)
+		}
+		publicKey, err := publicJWK(privateKey)
+		if err != nil {
+			return fmt.Errorf("failed to get public key for retired generation %q: %w", gen.Kid, err)
+		}
+		if _, exists := added[gen.Kid]; exists {
+			continue
+		}
+		if err := publicSet.AddKey(publicKey); err != nil {
+			return fmt.Errorf("failed to add retired public key %q to JWKS: %w", gen.Kid, err)
+		}
+		added[gen.Kid] = struct{}{}
+	}
+
+	jwksEncoded, err := json.Marshal(publicSet)
+	if err != nil {
+		return fmt.Errorf("failed to encode JWKS to JSON: %w", err)
+	}
+
+	newState := &signingKeyState{
+		activePrivate: activeKey,
+		keyID:         activeGen.Kid,
+		alg:           alg,
+		jwksEncoded:   jwksEncoded,
+		publicKeys:    publicSet,
+	}
+
+	previous := s.state.Swap(newState)
+	if previous == nil || previous.keyID != newState.keyID {
+		slog.Info("Active OIDC signing key", slog.String("kid", newState.keyID), slog.String("alg", alg.String()), slog.Int("published_keys", publicSet.Len()))
+	}
 	return nil
+}
+
+// orderedRetiredGenerations returns generations that are neither active nor expired, most recently retired first
+func orderedRetiredGenerations(set *jwkutils.SigningKeySet, now time.Time) []jwkutils.SigningKeyGeneration {
+	retired := make([]jwkutils.SigningKeyGeneration, 0, len(set.Generations))
+	for _, gen := range set.Generations {
+		if gen.Active() || gen.Expired(now) {
+			continue
+		}
+		retired = append(retired, gen)
+	}
+	// Sort without importing slices to keep the dependency surface small
+	for i := 0; i < len(retired); i++ {
+		for j := i + 1; j < len(retired); j++ {
+			if retired[j].RetiredAt != nil && (retired[i].RetiredAt == nil || retired[j].RetiredAt.After(*retired[i].RetiredAt)) {
+				retired[i], retired[j] = retired[j], retired[i]
+			}
+		}
+	}
+	return retired
+}
+
+// publicJWK derives the asymmetric public key published in the JWKS, carrying the key id and algorithm
+func publicJWK(privateKey jwk.Key) (jwk.Key, error) {
+	isPrivate, err := jwk.IsPrivateKey(privateKey)
+	if err != nil || !isPrivate {
+		// Defense in depth: a symmetric or already-public key can never be part of the external JWKS
+		return nil, errors.New("signing key is not an asymmetric private key")
+	}
+	publicKey, err := privateKey.PublicKey()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get public key: %w", err)
+	}
+	jwkutils.EnsureAlgInKey(publicKey, "", "")
+	return publicKey, nil
 }
 
 func ValidateKey(privateKey jwk.Key) error {
@@ -272,6 +346,8 @@ func ValidateSessionKey(sessionKey jwk.Key) error {
 	return nil
 }
 
+// SetKey sets a single key as the active signing key
+// It is used when no persistent set is involved, for example in minimal controllers and tests
 func (s *JwtService) SetKey(privateKey jwk.Key) error {
 	// Validate the loaded key
 	err := ValidateKey(privateKey)
@@ -279,30 +355,35 @@ func (s *JwtService) SetKey(privateKey jwk.Key) error {
 		return fmt.Errorf("private key is not valid: %w", err)
 	}
 
-	// Set the private key and key id in the object
-	s.privateKey = privateKey
-
-	keyId, ok := privateKey.KeyID()
-	if !ok {
+	kid, ok := privateKey.KeyID()
+	if !ok || kid == "" {
 		return errors.New("key object does not contain a key ID")
 	}
-	s.keyId = keyId
-
-	// Create and encode a JWKS containing the public key
-	publicKey, err := s.GetPublicJWK()
-	if err != nil {
-		return fmt.Errorf("failed to get public JWK: %w", err)
+	alg, ok := privateKey.Algorithm()
+	if !ok || alg == nil {
+		return errors.New("key object does not contain an algorithm")
 	}
-	jwks := jwk.NewSet()
-	err = jwks.AddKey(publicKey)
+
+	publicKey, err := publicJWK(privateKey)
 	if err != nil {
+		return err
+	}
+	publicSet := jwk.NewSet()
+	if err := publicSet.AddKey(publicKey); err != nil {
 		return fmt.Errorf("failed to add public key to JWKS: %w", err)
 	}
-	s.jwksEncoded, err = json.Marshal(jwks)
+	jwksEncoded, err := json.Marshal(publicSet)
 	if err != nil {
 		return fmt.Errorf("failed to encode JWKS to JSON: %w", err)
 	}
 
+	s.state.Store(&signingKeyState{
+		activePrivate: privateKey,
+		keyID:         kid,
+		alg:           alg,
+		jwksEncoded:   jwksEncoded,
+		publicKeys:    publicSet,
+	})
 	return nil
 }
 
@@ -317,6 +398,15 @@ func (s *JwtService) SetSessionKey(sessionKey jwk.Key) error {
 	s.sessionKey = sessionKey
 
 	return nil
+}
+
+// currentState returns the active signing snapshot or an error when the signer is not initialized
+func (s *JwtService) currentState() (*signingKeyState, error) {
+	state := s.state.Load()
+	if state == nil {
+		return nil, errors.New("key is not initialized")
+	}
+	return state, nil
 }
 
 func (s *JwtService) GenerateAccessToken(user model.User, authenticationMethod string, sessionDuration time.Duration) (string, error) {
@@ -362,6 +452,11 @@ func (s *JwtService) GenerateAccessToken(user model.User, authenticationMethod s
 // GenerateLogoutToken creates a logout token for OIDC Back-Channel Logout 1.0
 // The token identifies the user with a "sub" claim only, as Pocket ID does not track per-session "sid" values
 func (s *JwtService) GenerateLogoutToken(userID string, clientID string) (string, error) {
+	state, err := s.currentState()
+	if err != nil {
+		return "", err
+	}
+
 	now := time.Now()
 	token, err := jwt.NewBuilder().
 		Subject(userID).
@@ -383,12 +478,7 @@ func (s *JwtService) GenerateLogoutToken(userID string, clientID string) (string
 		return "", fmt.Errorf("failed to set 'typ' header: %w", err)
 	}
 
-	alg, err := s.GetKeyAlg()
-	if err != nil {
-		return "", err
-	}
-
-	signed, err := jwt.Sign(token, jwt.WithKey(alg, s.privateKey, jws.WithProtectedHeaders(headers)))
+	signed, err := jwt.Sign(token, jwt.WithKey(state.alg, state.activePrivate, jws.WithProtectedHeaders(headers)))
 	if err != nil {
 		return "", fmt.Errorf("failed to sign token: %w", err)
 	}
@@ -441,52 +531,157 @@ func (s *JwtService) VerifyAccessToken(tokenString string) (jwt.Token, error) {
 	)
 }
 
-// GetPublicJWK returns the JSON Web Key (JWK) for the public key.
+// GetPublicJWK returns the JSON Web Key (JWK) for the active public key
 func (s *JwtService) GetPublicJWK() (jwk.Key, error) {
-	if s.privateKey == nil {
-		return nil, errors.New("key is not initialized")
-	}
-
-	pubKey, err := s.privateKey.PublicKey()
+	state, err := s.currentState()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get public key: %w", err)
+		return nil, err
 	}
-
-	jwkutils.EnsureAlgInKey(pubKey, "", "")
-
-	return pubKey, nil
+	return publicJWK(state.activePrivate)
 }
 
-// GetPublicJWKSAsJSON returns the JSON Web Key Set (JWKS) for the public key, encoded as JSON.
-// The value is cached since the key is static.
+// GetPublicJWKSAsJSON returns the JWKS used for token verification, encoded as JSON
+// It contains the active public key and every retired public key still within its compatibility window
+// The value is cached per snapshot and only rebuilt when the persistent set changes
 func (s *JwtService) GetPublicJWKSAsJSON() ([]byte, error) {
-	if len(s.jwksEncoded) == 0 {
-		return nil, errors.New("key is not initialized")
+	state, err := s.currentState()
+	if err != nil {
+		return nil, err
 	}
-
-	return s.jwksEncoded, nil
+	return state.jwksEncoded, nil
 }
 
-// GetKeyAlg returns the algorithm of the key
+// GetKeyAlg returns the algorithm of the active signing key
 func (s *JwtService) GetKeyAlg() (jwa.KeyAlgorithm, error) {
-	if len(s.jwksEncoded) == 0 {
-		return nil, errors.New("key is not initialized")
+	state, err := s.currentState()
+	if err != nil {
+		return nil, err
 	}
-
-	alg, ok := s.privateKey.Algorithm()
-	if !ok || alg == nil {
-		return nil, errors.New("failed to retrieve algorithm for key")
-	}
-
-	return alg, nil
+	return state.alg, nil
 }
 
-// GetKeyID returns the key ID (kid) of the signing key, if one is set.
+// GetKeyAlgorithms returns the distinct algorithms of every published key, active first
+// Retired keys stay published during their compatibility window, so discovery must advertise their algorithms too
+func (s *JwtService) GetKeyAlgorithms() ([]string, error) {
+	state, err := s.currentState()
+	if err != nil {
+		return nil, err
+	}
+
+	algs := make([]string, 0, state.publicKeys.Len())
+	seen := make(map[string]struct{}, state.publicKeys.Len())
+	for i := range state.publicKeys.Len() {
+		key, ok := state.publicKeys.Key(i)
+		if !ok {
+			continue
+		}
+		alg, ok := key.Algorithm()
+		if !ok || alg == nil {
+			continue
+		}
+		name := alg.String()
+		if _, exists := seen[name]; exists {
+			continue
+		}
+		seen[name] = struct{}{}
+		algs = append(algs, name)
+	}
+	if len(algs) == 0 {
+		return nil, errors.New("no signing algorithm is published")
+	}
+	return algs, nil
+}
+
+// GetKeyID returns the key ID (kid) of the active signing key, if one is set
 func (s *JwtService) GetKeyID() (string, bool) {
-	if s.privateKey == nil {
+	state := s.state.Load()
+	if state == nil {
 		return "", false
 	}
-	return s.privateKey.KeyID()
+	return state.keyID, true
+}
+
+// GetVerificationKeySet returns the public keys used to verify OIDC tokens by kid
+// The set never contains private keys or the symmetric session key
+func (s *JwtService) GetVerificationKeySet() (jwk.Set, error) {
+	state, err := s.currentState()
+	if err != nil {
+		return nil, err
+	}
+	return state.publicKeys, nil
+}
+
+// GetVerificationKey returns the raw public key for a kid, used by the internal JWT signer when verifying tokens by their "kid" header
+// An unknown kid falls back to the caller, which should reject the token
+func (s *JwtService) GetVerificationKey(kid string) (any, bool) {
+	state := s.state.Load()
+	if state == nil || kid == "" {
+		return nil, false
+	}
+	pubKey, ok := state.publicKeys.LookupKeyID(kid)
+	if !ok {
+		return nil, false
+	}
+	rawKey, err := jwk.Export[any](pubKey)
+	if err != nil {
+		return nil, false
+	}
+	return rawKey, true
+}
+
+// ActivePrivateKey returns the private key of the active generation, mainly for diagnostics and tests
+func (s *JwtService) ActivePrivateKey() jwk.Key {
+	state := s.state.Load()
+	if state == nil {
+		return nil
+	}
+	return state.activePrivate
+}
+
+// ReloadSigningKeys refreshes the in-memory snapshot from the persistent set without generating anything
+// It is used by running instances to pick up rotations performed by the key-rotate command or another instance
+func (s *JwtService) ReloadSigningKeys(ctx context.Context) error {
+	loaded, err := jwkutils.LoadSigningKeySet(ctx, s.db, s.envConfig, s.instanceID)
+	if err != nil {
+		return fmt.Errorf("failed to reload signing key set: %w", err)
+	}
+	return s.applySigningKeySet(loaded, time.Now())
+}
+
+// RunSigningKeyReloader periodically reloads the persistent signing key set until the context is canceled
+func (s *JwtService) RunSigningKeyReloader(ctx context.Context) error {
+	ticker := time.NewTicker(signingKeyReloadInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			if err := s.ReloadSigningKeys(ctx); err != nil {
+				// Keep serving with the previous snapshot: it still signs new tokens and the next tick retries
+				slog.WarnContext(ctx, "Failed to reload OIDC signing key set, keeping current keys", slog.Any("error", err))
+			}
+		}
+	}
+}
+
+// CleanupExpiredRetiredKeys removes generations whose compatibility window has elapsed, then refreshes the snapshot
+// Removal is atomic and failure leaves everything in place, so the next scheduled run can retry safely
+func (s *JwtService) CleanupExpiredRetiredKeys(ctx context.Context) (int, error) {
+	removed, err := jwkutils.PruneRetiredSigningKeys(ctx, s.db, s.envConfig, s.instanceID, time.Now())
+	if err != nil {
+		return 0, err
+	}
+	if len(removed) == 0 {
+		return 0, nil
+	}
+
+	if err := s.ReloadSigningKeys(ctx); err != nil {
+		// The prune is already committed; a failed refresh only delays dropping the keys from the JWKS
+		slog.WarnContext(ctx, "Removed retired signing keys but failed to refresh JWKS snapshot", slog.Any("error", err))
+	}
+	return len(removed), nil
 }
 
 // GetAuthenticationMethod returns the first authentication method in the "amr" claim in the token
@@ -496,7 +691,7 @@ func (s *JwtService) GetAuthenticationMethod(token jwt.Token) (string, error) {
 	}
 	rawAuthenticationMethods, err := jwt.Get[[]any](token, common.AuthenticationMethodsClaim)
 	if err != nil {
-		return "", fmt.Errorf("failed to get '%s' claim from token: %w", common.AuthenticationMethodsClaim, err)
+		return "", fmt.Errorf("failed to get '%s' claim: %w", common.AuthenticationMethodsClaim, err)
 	}
 
 	if len(rawAuthenticationMethods) == 0 {
@@ -554,7 +749,12 @@ func TokenTypeValidator(expectedTokenType string) jwt.ValidatorFunc {
 	}
 }
 
+// GetPrivateKey returns the raw private key of the active generation for the fosite signer
 func (s *JwtService) GetPrivateKey() any {
-	privateKey, _ := jwk.Export[any](s.privateKey)
+	state := s.state.Load()
+	if state == nil {
+		return nil
+	}
+	privateKey, _ := jwk.Export[any](state.activePrivate)
 	return privateKey
 }

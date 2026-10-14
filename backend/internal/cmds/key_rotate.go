@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/lestrrat-go/jwx/v4/jwa"
 	"github.com/spf13/cobra"
@@ -14,15 +15,17 @@ import (
 	"github.com/pocket-id/pocket-id/backend/internal/bootstrap"
 	"github.com/pocket-id/pocket-id/backend/internal/common"
 	"github.com/pocket-id/pocket-id/backend/internal/instanceid"
+	"github.com/pocket-id/pocket-id/backend/internal/model"
 	"github.com/pocket-id/pocket-id/backend/internal/utils"
 	jwkutils "github.com/pocket-id/pocket-id/backend/internal/utils/jwk"
 )
 
 type keyRotateFlags struct {
-	Alg        string
-	Crv        string
-	SessionKey bool
-	Yes        bool
+	Alg           string
+	Crv           string
+	SessionKey    bool
+	RetentionDays int
+	Yes           bool
 }
 
 func init() {
@@ -32,10 +35,10 @@ func init() {
 		Use:   "key-rotate",
 		Short: "Generates a new signing key and replaces the current one",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// The session key is always a symmetric HS256 key, so the algorithm flags don't apply to it
-			if flags.SessionKey && (cmd.Flags().Changed("alg") || cmd.Flags().Changed("crv")) {
-				return errors.New("the --alg and --crv flags cannot be used together with --session-key")
-			}
+			// The session key is always a symmetric HS256 key, so the algorithm and retention flags don't apply to it
+		if flags.SessionKey && (cmd.Flags().Changed("alg") || cmd.Flags().Changed("crv") || cmd.Flags().Changed("retention-days")) {
+			return errors.New("the --alg, --crv and --retention-days flags cannot be used together with --session-key")
+		}
 
 			db, _, err := bootstrap.NewDatabase(cmd.Context())
 			if err != nil {
@@ -53,6 +56,7 @@ func init() {
 
 	keyRotateCmd.Flags().StringVarP(&flags.Alg, "alg", "a", "RS256", "Key algorithm. Supported values: RS256, RS384, RS512, ES256, ES384, ES512, EdDSA")
 	keyRotateCmd.Flags().StringVarP(&flags.Crv, "crv", "c", "", "Curve name when using EdDSA keys. Supported values: Ed25519")
+	keyRotateCmd.Flags().IntVar(&flags.RetentionDays, "retention-days", 0, fmt.Sprintf("Days the previous key stays published for verification after rotation (default: %d, the maximum token lifetime)", model.MaxTokenDurationMinutes/(24*60)))
 	keyRotateCmd.Flags().BoolVar(&flags.SessionKey, "session-key", false, "Rotate the key used to sign session tokens instead of the token signing key")
 	keyRotateCmd.Flags().BoolVarP(&flags.Yes, "yes", "y", false, "Do not prompt for confirmation")
 
@@ -88,8 +92,18 @@ func keyRotate(ctx context.Context, flags keyRotateFlags, db *gorm.DB, instanceI
 		return errors.New("unsupported key algorithm; supported values: RS256, RS384, RS512, ES256, ES384, ES512, EdDSA")
 	}
 
+	if flags.RetentionDays < 0 {
+		return errors.New("retention days must be a positive number")
+	}
+
+	// Zero means "use the default", which covers the longest configurable OIDC token lifetime
+	retention := time.Duration(flags.RetentionDays) * 24 * time.Hour
+	if flags.RetentionDays > 0 && retention < jwkutils.DefaultRetiredSigningKeyRetention() {
+		fmt.Printf("WARNING: a retention of %d day(s) is shorter than the maximum token lifetime of %d day(s); tokens issued with the previous key may fail verification before they expire.\n", flags.RetentionDays, model.MaxTokenDurationMinutes/(24*60))
+	}
+
 	if !flags.Yes {
-		fmt.Println("WARNING: Rotating the private key will invalidate all existing tokens. Both pocket-id and all client applications will likely need to be restarted.")
+		fmt.Printf("A new signing key becomes active immediately. Tokens issued with the previous key remain valid for %d day(s), and running instances pick up the new key automatically.\n", int(effectiveRetention(flags).Hours()/24))
 		ok, err := utils.PromptForConfirmation("Confirm")
 		if err != nil {
 			return err
@@ -100,28 +114,31 @@ func keyRotate(ctx context.Context, flags keyRotateFlags, db *gorm.DB, instanceI
 		}
 	}
 
-	// Get the key provider
-	keyProvider, err := jwkutils.GetKeyProvider(db, envConfig, instanceID)
+	// Rotation persists the new generation, retires the previous one and switches the active kid in one atomic operation
+	result, err := jwkutils.RotateSigningKeys(ctx, db, envConfig, instanceID, flags.Alg, flags.Crv, retention, time.Now())
 	if err != nil {
-		return fmt.Errorf("failed to get key provider: %w", err)
-	}
-
-	// Generate a new key
-	key, err := jwkutils.GenerateKey(flags.Alg, flags.Crv)
-	if err != nil {
-		return fmt.Errorf("failed to generate key: %w", err)
-	}
-
-	// Save the key
-	err = keyProvider.ReplaceKey(ctx, key)
-	if err != nil {
-		return fmt.Errorf("failed to store new key: %w", err)
+		if errors.Is(err, jwkutils.ErrSigningKeySetConflict) {
+			return errors.New("another key rotation changed the signing keys at the same time; no key was rotated, please retry")
+		}
+		return fmt.Errorf("failed to rotate signing key: %w", err)
 	}
 
 	fmt.Println("Key rotated successfully")
-	fmt.Println("Note: if pocket-id is running, you will need to restart it for the new key to be loaded")
+	fmt.Printf("New active key id: %s (%s)\n", result.NewActiveKid, flags.Alg)
+	if result.RetiredKid != "" {
+		fmt.Printf("Previous key %q remains published for verification for %d day(s)\n", result.RetiredKid, int(effectiveRetention(flags).Hours()/24))
+	}
+	fmt.Println("Running pocket-id instances load the new key automatically; client applications do not need to restart")
 
 	return nil
+}
+
+// effectiveRetention returns the requested compatibility window or the default that covers every configurable token lifetime
+func effectiveRetention(flags keyRotateFlags) time.Duration {
+	if flags.RetentionDays > 0 {
+		return time.Duration(flags.RetentionDays) * 24 * time.Hour
+	}
+	return jwkutils.DefaultRetiredSigningKeyRetention()
 }
 
 func sessionKeyRotate(ctx context.Context, flags keyRotateFlags, db *gorm.DB, instanceID string, envConfig *common.EnvConfigSchema) error {

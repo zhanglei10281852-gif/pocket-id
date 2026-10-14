@@ -1,0 +1,22 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: 签名密钥以持久代际保存且任一时刻只有一个活动代，并发 key-rotate 或轮换进程退出不会产生分叉活动密钥。
+  - id: 2
+    type: f2p
+    text: 活动代切换后所有实例与重启后的 JwtService 都使用新私钥和 kid 签发新 ID、access 与 logout token，不会继续由旧代签发。
+  - id: 3
+    type: f2p
+    text: JWKS 同时发布活动公钥和兼容窗口内的退役公钥，使轮换前仍有效的令牌与轮换后新令牌都可验证，并且不泄露私钥或 HS256 session key。
+  - id: 4
+    type: f2p
+    text: 退役期限覆盖轮换时仍可能有效的既有 OIDC 令牌，期限到达前不会删除所需公钥，期限到达后能够确定回收。
+  - id: 5
+    type: f2p
+    text: 退役密钥删除失败或清理进程重启时会保留验证能力并可重试；恢复不会提前删除密钥，也不会把退役代重新选为活动代。
+  - id: 6
+    type: p2p
+    text: RS256 默认行为及现有 RSA、ECDSA、EdDSA 算法选择仍能轮换和签发，discovery 与 JWKS 接口保持既有协议格式。
+  - id: 7
+    type: p2p
+    text: Pocket ID 自身的 HS256 session key 仍与 OIDC signing key 独立，session key 的加载、验证和单独轮换行为不受影响。

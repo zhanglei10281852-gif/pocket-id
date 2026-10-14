@@ -6,9 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/rsa"
 	"errors"
-	"sync"
 	"testing"
 	"time"
 
@@ -102,21 +100,22 @@ func TestJwtService_Init(t *testing.T) {
 		service := initJwtService(t, db, instanceID, mockConfig, mockEnvConfig)
 
 		// Verify the private key was set
-		require.NotNil(t, service.privateKey, "Private key should be set")
+		require.NotNil(t, service.ActivePrivateKey(), "Private key should be set")
 
-		// Verify the key has been persisted in the database
-		keyProvider, err := jwkutils.GetKeyProvider(db, mockEnvConfig, instanceID)
-		require.NoError(t, err, "Failed to init key provider")
-		key, err := keyProvider.LoadKey(t.Context())
-		require.NoError(t, err, "Failed to load key from provider")
-		require.NotNil(t, key, "Key should be present in the database")
+		// Verify the key has been persisted in the signing key set
+		loaded, err := jwkutils.LoadSigningKeySet(t.Context(), db, mockEnvConfig, instanceID)
+		require.NoError(t, err, "Failed to load signing key set")
+		activeKey, activeGen := loaded.ActiveKey()
+		require.NotNil(t, activeKey, "Active key should be present in the database")
+		require.NotNil(t, activeGen, "An active generation should be present")
+		assert.Nil(t, activeGen.RetiredAt, "The only generation should be active")
 
 		// Key should have required properties
-		keyID, ok := key.KeyID()
+		keyID, ok := activeKey.KeyID()
 		assert.True(t, ok, "Key should have a key ID")
 		assert.NotEmpty(t, keyID)
 
-		keyUsage, ok := key.KeyUsage()
+		keyUsage, ok := activeKey.KeyUsage()
 		assert.True(t, ok, "Key should have a key usage")
 		assert.Equal(t, KeyUsageSigning, keyUsage)
 	})
@@ -130,14 +129,14 @@ func TestJwtService_Init(t *testing.T) {
 		firstService := initJwtService(t, db, instanceID, mockConfig, mockEnvConfig)
 
 		// Get the key ID of the first service
-		origKeyID, ok := firstService.privateKey.KeyID()
+		origKeyID, ok := firstService.ActivePrivateKey().KeyID()
 		require.True(t, ok)
 
 		// Now create a new service that should load the existing key
 		secondService := initJwtService(t, db, instanceID, mockConfig, mockEnvConfig)
 
 		// Verify the loaded key has the same ID as the original
-		loadedKeyID, ok := secondService.privateKey.KeyID()
+		loadedKeyID, ok := secondService.ActivePrivateKey().KeyID()
 		require.True(t, ok)
 		assert.Equal(t, origKeyID, loadedKeyID, "Loaded key should have the same ID as the original")
 	})
@@ -154,12 +153,12 @@ func TestJwtService_Init(t *testing.T) {
 		svc := initJwtService(t, db, instanceID, mockConfig, mockEnvConfig)
 
 		// Ensure loaded key has the right algorithm
-		alg, ok := svc.privateKey.Algorithm()
+		alg, ok := svc.ActivePrivateKey().Algorithm()
 		_ = assert.True(t, ok) &&
 			assert.Equal(t, jwa.ES256().String(), alg.String(), "Loaded key has the incorrect algorithm")
 
 		// Verify the loaded key has the same ID as the original
-		loadedKeyID, ok := svc.privateKey.KeyID()
+		loadedKeyID, ok := svc.ActivePrivateKey().KeyID()
 		_ = assert.True(t, ok) &&
 			assert.Equal(t, origKeyID, loadedKeyID, "Loaded key should have the same ID as the original")
 	})
@@ -176,21 +175,21 @@ func TestJwtService_Init(t *testing.T) {
 		svc := initJwtService(t, db, instanceID, mockConfig, mockEnvConfig)
 
 		// Ensure loaded key has the right algorithm and curve
-		alg, ok := svc.privateKey.Algorithm()
+		alg, ok := svc.ActivePrivateKey().Algorithm()
 		_ = assert.True(t, ok) &&
 			assert.Equal(t, jwa.EdDSA().String(), alg.String(), "Loaded key has the incorrect algorithm")
 
-		curve, err := jwk.Get[jwa.EllipticCurveAlgorithm](svc.privateKey, "crv")
+		curve, err := jwk.Get[jwa.EllipticCurveAlgorithm](svc.ActivePrivateKey(), "crv")
 		_ = assert.NoError(t, err, "Failed to get 'crv' claim") &&
 			assert.Equal(t, jwa.Ed25519().String(), curve.String(), "Curve does not match expected value")
 
 		// Verify the loaded key has the same ID as the original
-		loadedKeyID, ok := svc.privateKey.KeyID()
+		loadedKeyID, ok := svc.ActivePrivateKey().KeyID()
 		_ = assert.True(t, ok) &&
 			assert.Equal(t, origKeyID, loadedKeyID, "Loaded key should have the same ID as the original")
 	})
 
-	for _, dbKey := range []string{jwkutils.PrivateKeyDBKey, jwkutils.SessionKeyDBKey} {
+	for _, dbKey := range []string{jwkutils.SigningKeysDBKey, jwkutils.SessionKeyDBKey} {
 		t.Run("should not retry a failed database write for "+dbKey, func(t *testing.T) {
 			// Configure the database to fail the first attempt for the selected key
 			db := testutils.NewDatabaseForTest(t)
@@ -297,7 +296,7 @@ func TestJwtService_SessionKey(t *testing.T) {
 
 		service := initJwtService(t, db, instanceID, mockConfig, mockEnvConfig)
 
-		signingKeyID, ok := service.privateKey.KeyID()
+		signingKeyID, ok := service.ActivePrivateKey().KeyID()
 		require.True(t, ok)
 		sessionKeyID, ok := service.sessionKey.KeyID()
 		require.True(t, ok)
@@ -494,10 +493,8 @@ func TestJwtService_GetPublicJWK(t *testing.T) {
 	})
 
 	t.Run("returns error when private key is not initialized", func(t *testing.T) {
-		// Create a service with nil private key
-		service := &JwtService{
-			privateKey: nil,
-		}
+		// Create a service with no loaded key
+		service := &JwtService{}
 
 		// Try to get the JWK
 		publicKey, err := service.GetPublicJWK()
@@ -602,10 +599,10 @@ func TestGenerateVerifyAccessToken(t *testing.T) {
 	})
 
 	t.Run("works with Ed25519 keys", func(t *testing.T) {
-		origKeyID := createEdDSAKeyJWK(t, db, instanceID, envConfig)
+		origKeyID := rotateSigningKeyForTest(t, db, instanceID, envConfig, jwa.EdDSA().String(), jwa.Ed25519().String())
 		service := initJwtService(t, db, instanceID, mockConfig, envConfig)
 
-		loadedKeyID, ok := service.privateKey.KeyID()
+		loadedKeyID, ok := service.ActivePrivateKey().KeyID()
 		require.True(t, ok)
 		assert.Equal(t, origKeyID, loadedKeyID, "Loaded key should have the same ID as the original")
 
@@ -641,10 +638,10 @@ func TestGenerateVerifyAccessToken(t *testing.T) {
 	})
 
 	t.Run("works with P-256 keys", func(t *testing.T) {
-		origKeyID := createECDSAKeyJWK(t, db, instanceID, envConfig)
+		origKeyID := rotateSigningKeyForTest(t, db, instanceID, envConfig, jwa.ES256().String(), "")
 		service := initJwtService(t, db, instanceID, mockConfig, envConfig)
 
-		loadedKeyID, ok := service.privateKey.KeyID()
+		loadedKeyID, ok := service.ActivePrivateKey().KeyID()
 		require.True(t, ok)
 		assert.Equal(t, origKeyID, loadedKeyID, "Loaded key should have the same ID as the original")
 
@@ -679,11 +676,11 @@ func TestGenerateVerifyAccessToken(t *testing.T) {
 		assert.Equal(t, "ES256", alg.String(), "Algorithm should be ES256")
 	})
 
-	t.Run("works with RSA-4096 keys", func(t *testing.T) {
-		origKeyID := createRSA4096KeyJWK(t, db, instanceID, envConfig)
+	t.Run("works with RSA keys rotated to RS512", func(t *testing.T) {
+		origKeyID := rotateSigningKeyForTest(t, db, instanceID, envConfig, jwa.RS512().String(), "")
 		service := initJwtService(t, db, instanceID, mockConfig, envConfig)
 
-		loadedKeyID, ok := service.privateKey.KeyID()
+		loadedKeyID, ok := service.ActivePrivateKey().KeyID()
 		require.True(t, ok)
 		assert.Equal(t, origKeyID, loadedKeyID, "Loaded key should have the same ID as the original")
 
@@ -715,7 +712,7 @@ func TestGenerateVerifyAccessToken(t *testing.T) {
 		assert.Equal(t, jwa.RSA().String(), publicKey.KeyType().String(), "Key type should be RSA")
 		alg, ok := publicKey.Algorithm()
 		require.True(t, ok)
-		assert.Equal(t, jwa.RS256().String(), alg.String(), "Algorithm should be RS256")
+		assert.Equal(t, jwa.RS512().String(), alg.String(), "Algorithm should be RS512")
 	})
 }
 
@@ -772,25 +769,13 @@ func importKey(t *testing.T, db *gorm.DB, instanceID string, envConfig *common.E
 	return saveKeyToDatabase(t, db, instanceID, envConfig, privateKey)
 }
 
-// Because generating a RSA-406 key isn't immediate, we pre-compute one
-var (
-	rsaKeyPrecomputed    *rsa.PrivateKey
-	rsaKeyPrecomputeOnce sync.Once
-)
-
-func createRSA4096KeyJWK(t *testing.T, db *gorm.DB, instanceID string, envConfig *common.EnvConfigSchema) string {
+// rotateSigningKeyForTest rotates the persistent signing key set to the requested algorithm and returns the new active kid
+func rotateSigningKeyForTest(t *testing.T, db *gorm.DB, instanceID string, envConfig *common.EnvConfigSchema, alg, crv string) string {
 	t.Helper()
 
-	rsaKeyPrecomputeOnce.Do(func() {
-		var err error
-		rsaKeyPrecomputed, err = rsa.GenerateKey(rand.Reader, 4096)
-		if err != nil {
-			panic("failed to precompute RSA key: " + err.Error())
-		}
-	})
-
-	// Import as JWK and save it
-	return importKey(t, db, instanceID, envConfig, rsaKeyPrecomputed)
+	result, err := jwkutils.RotateSigningKeys(t.Context(), db, envConfig, instanceID, alg, crv, jwkutils.DefaultRetiredSigningKeyRetention(), time.Now())
+	require.NoError(t, err, "Failed to rotate signing key")
+	return result.NewActiveKid
 }
 
 func createECDSAKeyJWK(t *testing.T, db *gorm.DB, instanceID string, envConfig *common.EnvConfigSchema) string {

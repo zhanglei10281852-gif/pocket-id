@@ -87,9 +87,10 @@ func (wkc *WellKnownController) computeServerMetadata() ([]byte, error) {
 
 	internalAppUrl := common.EnvConfig.InternalAppURL
 
-	alg, err := wkc.jwtService.GetKeyAlg()
+	// Advertise the algorithm of the active key and every retired key still published, so apps keep accepting rotated keys
+	algs, err := wkc.jwtService.GetKeyAlgorithms()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get key algorithm: %w", err)
+		return nil, fmt.Errorf("failed to get key algorithms: %w", err)
 	}
 	cimdSupported := false
 	if wkc.getCIMDURLAllowlist != nil {
@@ -112,7 +113,7 @@ func (wkc *WellKnownController) computeServerMetadata() ([]byte, error) {
 		"response_types_supported":                       []string{"code"},
 		"response_modes_supported":                       []string{"query", "fragment", "form_post"},
 		"subject_types_supported":                        []string{"public"},
-		"id_token_signing_alg_values_supported":          []string{alg.String()},
+		"id_token_signing_alg_values_supported":          algs,
 		"authorization_response_iss_parameter_supported": true,
 		"code_challenge_methods_supported":               []string{"plain", "S256"},
 		"request_parameter_supported":                    true,

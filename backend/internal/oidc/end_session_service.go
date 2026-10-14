@@ -95,20 +95,32 @@ func (s *endSessionService) endSession(ctx context.Context, input dto.OidcLogout
 }
 
 func (s *endSessionService) verifyIDTokenHint(tokenString string) (jwt.Token, error) {
-	alg, err := s.signer.GetKeyAlg()
-	if err != nil {
-		return nil, err
-	}
-
-	token, err := jwt.ParseString(
-		tokenString,
+	// A signer with multiple generations verifies by the token's kid, so ID tokens signed before a rotation keep working
+	parseOptions := []jwt.ParseOption{
 		jwt.WithValidate(true),
-		jwt.WithKey(alg, s.signer.GetPrivateKey()),
 		jwt.WithAcceptableSkew(time.Minute),
 		jwt.WithResetValidators(true),
 		jwt.WithIssuer(s.baseURL),
 		jwt.WithValidator(jwt.IsIssuedAtValid()),
 		jwt.WithValidator(jwt.IsNbfValid()),
+	}
+	if resolver, ok := s.signer.(KeySetResolver); ok {
+		keySet, err := resolver.GetVerificationKeySet()
+		if err != nil {
+			return nil, err
+		}
+		parseOptions = append(parseOptions, jwt.WithKeySet(keySet))
+	} else {
+		alg, err := s.signer.GetKeyAlg()
+		if err != nil {
+			return nil, err
+		}
+		parseOptions = append(parseOptions, jwt.WithKey(alg, s.signer.GetPrivateKey()))
+	}
+
+	token, err := jwt.ParseString(
+		tokenString,
+		parseOptions...,
 	)
 	if err != nil {
 		return nil, err

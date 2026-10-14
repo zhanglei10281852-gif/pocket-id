@@ -109,6 +109,9 @@ func Bootstrap(ctx context.Context) error {
 	// Migrate the pre-actor signup tokens into their actors, once the actor host is ready
 	services = append(services, actorsReady.Await(svc.userSignUpModule.RunSignupTokenMigration))
 
+	// Keep this instance's OIDC signer aligned with the persistent active generation, so rotations take effect without a restart
+	services = append(services, svc.jwtService.RunSigningKeyReloader)
+
 	// Only the GeoLite provider needs a background database refresher
 	if !common.EnvConfig.AppEnv.IsTest() && svc.geoLiteModule != nil {
 		// Refresh the GeoLite database (this is cached per each replica)

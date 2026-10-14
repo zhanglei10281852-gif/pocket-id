@@ -93,12 +93,18 @@ func encryptionKeyRotate(ctx context.Context, flags encryptionKeyRotateFlags, db
 	}
 
 	err = db.Transaction(func(tx *gorm.DB) error {
-		// Both the key used for tokens meant for external consumption and the session key are encrypted with the KEK
+		// The session key is encrypted with the KEK, as is the legacy single signing key row kept for deployments that have not started the new code yet
 		for _, dbKey := range []string{jwkutils.PrivateKeyDBKey, jwkutils.SessionKeyDBKey} {
 			err = rotateJWKEncryption(ctx, tx, oldKek, newKek, dbKey)
 			if err != nil {
 				return err
 			}
+		}
+
+		// The persistent signing key set stores one encrypted private JWK per generation, all of which are re-wrapped
+		err = jwkutils.ReEncryptSigningKeySet(ctx, tx, oldKek, newKek)
+		if err != nil {
+			return err
 		}
 
 		err = rotateScimTokens(tx, oldEncKey, newEncKey)

@@ -39,11 +39,15 @@ func SigningKeyFromSigner(signer TokenSigner) (*jose.JSONWebKey, error) {
 
 type jwtSigner struct {
 	*fositejwt.DefaultSigner
+	// resolveVerificationKey looks up the public key of active and still-compatible retired generations by kid
+	// It may be nil for signers that only expose the active key, such as minimal test doubles
+	resolveVerificationKey func(kid string) (any, bool)
 }
 
-func newJWTSigner(keyGetter fositejwt.GetPrivateKeyFunc) *jwtSigner {
+func newJWTSigner(keyGetter fositejwt.GetPrivateKeyFunc, resolveVerificationKey func(kid string) (any, bool)) *jwtSigner {
 	return &jwtSigner{
-		DefaultSigner: &fositejwt.DefaultSigner{GetPrivateKey: keyGetter},
+		DefaultSigner:          &fositejwt.DefaultSigner{GetPrivateKey: keyGetter},
+		resolveVerificationKey: resolveVerificationKey,
 	}
 }
 
@@ -55,17 +59,27 @@ func (s *jwtSigner) Validate(ctx context.Context, token string) (string, error) 
 }
 
 func (s *jwtSigner) Decode(ctx context.Context, token string) (*fositejwt.Token, error) {
+	// The active key doubles as the fallback for tokens without a kid and for test signers
 	key, err := s.GetPrivateKey(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	verificationKey := key
-	if jsonWebKey, ok := key.(*jose.JSONWebKey); ok {
-		verificationKey = new(jsonWebKey.Public())
-	}
+	return fositejwt.Parse(token, func(parsed *fositejwt.Token) (any, error) {
+		// Pick the public key matching the token's kid so tokens signed by a retired-but-still-valid generation verify
+		if s.resolveVerificationKey != nil {
+			if kid, _ := parsed.Header["kid"].(string); kid != "" {
+				if verificationKey, ok := s.resolveVerificationKey(kid); ok {
+					return verificationKey, nil
+				}
+			}
+		}
 
-	return fositejwt.Parse(token, func(*fositejwt.Token) (any, error) {
+		verificationKey := key
+		if jsonWebKey, ok := key.(*jose.JSONWebKey); ok {
+			publicKey := jsonWebKey.Public()
+			return &publicKey, nil
+		}
 		return verificationKey, nil
 	})
 }

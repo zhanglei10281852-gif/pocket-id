@@ -1,0 +1,2970 @@
+diff --git a/backend/internal/bootstrap/bootstrap.go b/backend/internal/bootstrap/bootstrap.go
+index 66250de9..f5a5aa5d 100644
+--- a/backend/internal/bootstrap/bootstrap.go
++++ b/backend/internal/bootstrap/bootstrap.go
+@@ -109,6 +109,9 @@ func Bootstrap(ctx context.Context) error {
+ 	// Migrate the pre-actor signup tokens into their actors, once the actor host is ready
+ 	services = append(services, actorsReady.Await(svc.userSignUpModule.RunSignupTokenMigration))
+ 
++	// Keep this instance's OIDC signer aligned with the persistent active generation, so rotations take effect without a restart
++	services = append(services, svc.jwtService.RunSigningKeyReloader)
++
+ 	// Only the GeoLite provider needs a background database refresher
+ 	if !common.EnvConfig.AppEnv.IsTest() && svc.geoLiteModule != nil {
+ 		// Refresh the GeoLite database (this is cached per each replica)
+diff --git a/backend/internal/bootstrap/services_bootstrap.go b/backend/internal/bootstrap/services_bootstrap.go
+index 4312141a..fa75d370 100644
+--- a/backend/internal/bootstrap/services_bootstrap.go
++++ b/backend/internal/bootstrap/services_bootstrap.go
+@@ -101,6 +101,14 @@ func initServices(
+ 		return nil, fmt.Errorf("failed to create JWT service: %w", err)
+ 	}
+ 
++	// Register the daily job that deletes retired OIDC signing keys once their compatibility window has elapsed
++	if !common.EnvConfig.AppEnv.IsTest() {
++		err = registerRetiredSigningKeysCleanup(actors, svc.jwtService)
++		if err != nil {
++			return nil, err
++		}
++	}
++
+ 	svc.auditLogsModule, err = auditlogs.New(auditlogs.Dependencies{
+ 		Signer:        svc.jwtService,
+ 		AppURL:        common.EnvConfig.AppURL,
+diff --git a/backend/internal/bootstrap/signing_keys_bootstrap.go b/backend/internal/bootstrap/signing_keys_bootstrap.go
+new file mode 100644
+index 00000000..7967aaf6
+--- /dev/null
++++ b/backend/internal/bootstrap/signing_keys_bootstrap.go
+@@ -0,0 +1,50 @@
++package bootstrap
++
++import (
++	"context"
++	"fmt"
++	"log/slog"
++	"time"
++
++	"github.com/italypaleale/francis/builtin/cronjob"
++	francishost "github.com/italypaleale/francis/host"
++
++	"github.com/pocket-id/pocket-id/backend/internal/service"
++)
++
++const (
++	retiredSigningKeysCleanupInterval = 24 * time.Hour
++	retiredSigningKeysCleanupJitter   = 5 * time.Minute
++)
++
++// registerRetiredSigningKeysCleanup registers the daily actor that removes signing generations after their compatibility window
++func registerRetiredSigningKeysCleanup(actors francishost.Host, jwtService *service.JwtService) error {
++	job := func(ctx context.Context) error {
++		count, err := jwtService.CleanupExpiredRetiredKeys(ctx)
++		if err != nil {
++			return fmt.Errorf("failed to prune retired OIDC signing keys: %w", err)
++		}
++		if count > 0 {
++			slog.InfoContext(ctx, "Removed retired OIDC signing keys past their compatibility window", slog.Int("count", count))
++		}
++		return nil
++	}
++
++	cronActor, err := cronjob.New(
++		"PruneRetiredOIDCSigningKeys",
++		cronjob.WithJob(job),
++		cronjob.WithInterval(retiredSigningKeysCleanupInterval),
++		cronjob.WithJitter(retiredSigningKeysCleanupJitter),
++		// Also run at startup so generations that expired while Pocket ID was stopped are removed immediately
++		cronjob.WithImmediate(),
++		cronjob.WithLogger(slog.Default()),
++	)
++	if err != nil {
++		return fmt.Errorf("error creating PruneRetiredOIDCSigningKeys cron job: %w", err)
++	}
++
++	if err := actors.RegisterBuiltInActor(cronActor); err != nil {
++		return fmt.Errorf("error registering PruneRetiredOIDCSigningKeys cron actor: %w", err)
++	}
++	return nil
++}
+diff --git a/backend/internal/cmds/encryption_key_rotate.go b/backend/internal/cmds/encryption_key_rotate.go
+index 36f65f83..58fd2a55 100644
+--- a/backend/internal/cmds/encryption_key_rotate.go
++++ b/backend/internal/cmds/encryption_key_rotate.go
+@@ -93,7 +93,7 @@ func encryptionKeyRotate(ctx context.Context, flags encryptionKeyRotateFlags, db
+ 	}
+ 
+ 	err = db.Transaction(func(tx *gorm.DB) error {
+-		// Both the key used for tokens meant for external consumption and the session key are encrypted with the KEK
++		// The session key is encrypted with the KEK, as is the legacy single signing key row kept for deployments that have not started the new code yet
+ 		for _, dbKey := range []string{jwkutils.PrivateKeyDBKey, jwkutils.SessionKeyDBKey} {
+ 			err = rotateJWKEncryption(ctx, tx, oldKek, newKek, dbKey)
+ 			if err != nil {
+@@ -101,6 +101,12 @@ func encryptionKeyRotate(ctx context.Context, flags encryptionKeyRotateFlags, db
+ 			}
+ 		}
+ 
++		// The persistent signing key set stores one encrypted private JWK per generation, all of which are re-wrapped
++		err = jwkutils.ReEncryptSigningKeySet(ctx, tx, oldKek, newKek)
++		if err != nil {
++			return err
++		}
++
+ 		err = rotateScimTokens(tx, oldEncKey, newEncKey)
+ 		if err != nil {
+ 			return err
+diff --git a/backend/internal/cmds/key_rotate.go b/backend/internal/cmds/key_rotate.go
+index b9303dce..3e0e66c1 100644
+--- a/backend/internal/cmds/key_rotate.go
++++ b/backend/internal/cmds/key_rotate.go
+@@ -6,6 +6,7 @@ import (
+ 	"fmt"
+ 	"os"
+ 	"strings"
++	"time"
+ 
+ 	"github.com/lestrrat-go/jwx/v4/jwa"
+ 	"github.com/spf13/cobra"
+@@ -14,15 +15,17 @@ import (
+ 	"github.com/pocket-id/pocket-id/backend/internal/bootstrap"
+ 	"github.com/pocket-id/pocket-id/backend/internal/common"
+ 	"github.com/pocket-id/pocket-id/backend/internal/instanceid"
++	"github.com/pocket-id/pocket-id/backend/internal/model"
+ 	"github.com/pocket-id/pocket-id/backend/internal/utils"
+ 	jwkutils "github.com/pocket-id/pocket-id/backend/internal/utils/jwk"
+ )
+ 
+ type keyRotateFlags struct {
+-	Alg        string
+-	Crv        string
+-	SessionKey bool
+-	Yes        bool
++	Alg           string
++	Crv           string
++	SessionKey    bool
++	RetentionDays int
++	Yes           bool
+ }
+ 
+ func init() {
+@@ -32,10 +35,10 @@ func init() {
+ 		Use:   "key-rotate",
+ 		Short: "Generates a new signing key and replaces the current one",
+ 		RunE: func(cmd *cobra.Command, args []string) error {
+-			// The session key is always a symmetric HS256 key, so the algorithm flags don't apply to it
+-			if flags.SessionKey && (cmd.Flags().Changed("alg") || cmd.Flags().Changed("crv")) {
+-				return errors.New("the --alg and --crv flags cannot be used together with --session-key")
+-			}
++			// The session key is always a symmetric HS256 key, so the algorithm and retention flags don't apply to it
++		if flags.SessionKey && (cmd.Flags().Changed("alg") || cmd.Flags().Changed("crv") || cmd.Flags().Changed("retention-days")) {
++			return errors.New("the --alg, --crv and --retention-days flags cannot be used together with --session-key")
++		}
+ 
+ 			db, _, err := bootstrap.NewDatabase(cmd.Context())
+ 			if err != nil {
+@@ -53,6 +56,7 @@ func init() {
+ 
+ 	keyRotateCmd.Flags().StringVarP(&flags.Alg, "alg", "a", "RS256", "Key algorithm. Supported values: RS256, RS384, RS512, ES256, ES384, ES512, EdDSA")
+ 	keyRotateCmd.Flags().StringVarP(&flags.Crv, "crv", "c", "", "Curve name when using EdDSA keys. Supported values: Ed25519")
++	keyRotateCmd.Flags().IntVar(&flags.RetentionDays, "retention-days", 0, fmt.Sprintf("Days the previous key stays published for verification after rotation (default: %d, the maximum token lifetime)", model.MaxTokenDurationMinutes/(24*60)))
+ 	keyRotateCmd.Flags().BoolVar(&flags.SessionKey, "session-key", false, "Rotate the key used to sign session tokens instead of the token signing key")
+ 	keyRotateCmd.Flags().BoolVarP(&flags.Yes, "yes", "y", false, "Do not prompt for confirmation")
+ 
+@@ -88,8 +92,18 @@ func keyRotate(ctx context.Context, flags keyRotateFlags, db *gorm.DB, instanceI
+ 		return errors.New("unsupported key algorithm; supported values: RS256, RS384, RS512, ES256, ES384, ES512, EdDSA")
+ 	}
+ 
++	if flags.RetentionDays < 0 {
++		return errors.New("retention days must be a positive number")
++	}
++
++	// Zero means "use the default", which covers the longest configurable OIDC token lifetime
++	retention := time.Duration(flags.RetentionDays) * 24 * time.Hour
++	if flags.RetentionDays > 0 && retention < jwkutils.DefaultRetiredSigningKeyRetention() {
++		fmt.Printf("WARNING: a retention of %d day(s) is shorter than the maximum token lifetime of %d day(s); tokens issued with the previous key may fail verification before they expire.\n", flags.RetentionDays, model.MaxTokenDurationMinutes/(24*60))
++	}
++
+ 	if !flags.Yes {
+-		fmt.Println("WARNING: Rotating the private key will invalidate all existing tokens. Both pocket-id and all client applications will likely need to be restarted.")
++		fmt.Printf("A new signing key becomes active immediately. Tokens issued with the previous key remain valid for %d day(s), and running instances pick up the new key automatically.\n", int(effectiveRetention(flags).Hours()/24))
+ 		ok, err := utils.PromptForConfirmation("Confirm")
+ 		if err != nil {
+ 			return err
+@@ -100,30 +114,33 @@ func keyRotate(ctx context.Context, flags keyRotateFlags, db *gorm.DB, instanceI
+ 		}
+ 	}
+ 
+-	// Get the key provider
+-	keyProvider, err := jwkutils.GetKeyProvider(db, envConfig, instanceID)
++	// Rotation persists the new generation, retires the previous one and switches the active kid in one atomic operation
++	result, err := jwkutils.RotateSigningKeys(ctx, db, envConfig, instanceID, flags.Alg, flags.Crv, retention, time.Now())
+ 	if err != nil {
+-		return fmt.Errorf("failed to get key provider: %w", err)
+-	}
+-
+-	// Generate a new key
+-	key, err := jwkutils.GenerateKey(flags.Alg, flags.Crv)
+-	if err != nil {
+-		return fmt.Errorf("failed to generate key: %w", err)
+-	}
+-
+-	// Save the key
+-	err = keyProvider.ReplaceKey(ctx, key)
+-	if err != nil {
+-		return fmt.Errorf("failed to store new key: %w", err)
++		if errors.Is(err, jwkutils.ErrSigningKeySetConflict) {
++			return errors.New("another key rotation changed the signing keys at the same time; no key was rotated, please retry")
++		}
++		return fmt.Errorf("failed to rotate signing key: %w", err)
+ 	}
+ 
+ 	fmt.Println("Key rotated successfully")
+-	fmt.Println("Note: if pocket-id is running, you will need to restart it for the new key to be loaded")
++	fmt.Printf("New active key id: %s (%s)\n", result.NewActiveKid, flags.Alg)
++	if result.RetiredKid != "" {
++		fmt.Printf("Previous key %q remains published for verification for %d day(s)\n", result.RetiredKid, int(effectiveRetention(flags).Hours()/24))
++	}
++	fmt.Println("Running pocket-id instances load the new key automatically; client applications do not need to restart")
+ 
+ 	return nil
+ }
+ 
++// effectiveRetention returns the requested compatibility window or the default that covers every configurable token lifetime
++func effectiveRetention(flags keyRotateFlags) time.Duration {
++	if flags.RetentionDays > 0 {
++		return time.Duration(flags.RetentionDays) * 24 * time.Hour
++	}
++	return jwkutils.DefaultRetiredSigningKeyRetention()
++}
++
+ func sessionKeyRotate(ctx context.Context, flags keyRotateFlags, db *gorm.DB, instanceID string, envConfig *common.EnvConfigSchema) error {
+ 	if !flags.Yes {
+ 		fmt.Println("WARNING: Rotating the session key will invalidate all existing sessions, and all users will need to sign in again. Tokens issued to client applications are not affected.")
+diff --git a/backend/internal/cmds/key_rotate_test.go b/backend/internal/cmds/key_rotate_test.go
+index 81494e8d..44babbaf 100644
+--- a/backend/internal/cmds/key_rotate_test.go
++++ b/backend/internal/cmds/key_rotate_test.go
+@@ -2,6 +2,7 @@ package cmds
+ 
+ import (
+ 	"testing"
++	"time"
+ 
+ 	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
+@@ -63,6 +64,16 @@ func TestKeyRotate(t *testing.T) {
+ 			wantErr: true,
+ 			errMsg:  "key algorithm is required",
+ 		},
++		{
++			name: "negative retention",
++			flags: keyRotateFlags{
++				Alg:           "RS256",
++				RetentionDays: -1,
++				Yes:           true,
++			},
++			wantErr: true,
++			errMsg:  "retention days must be a positive number",
++		},
+ 	}
+ 
+ 	for _, tt := range tests {
+@@ -73,22 +84,14 @@ func TestKeyRotate(t *testing.T) {
+ }
+ 
+ func testKeyRotateWithDatabaseStorage(t *testing.T, flags keyRotateFlags, wantErr bool, errMsg string) {
+-	// Set up database storage config
+ 	envConfig := &common.EnvConfigSchema{
+ 		EncryptionKey: []byte("test-encryption-key-characters-long"),
+ 	}
+ 
+-	// Create test database
+ 	db := testingutils.NewDatabaseForTest(t)
+-
+-	// Load the instance ID
+ 	instanceID, err := instanceid.Load(t.Context(), db)
+ 	require.NoError(t, err)
+ 
+-	// Get key provider
+-	keyProvider, err := jwkutils.GetKeyProvider(db, envConfig, instanceID)
+-	require.NoError(t, err)
+-
+ 	// Run the key rotation
+ 	err = keyRotate(t.Context(), flags, db, instanceID, envConfig)
+ 
+@@ -99,21 +102,21 @@ func testKeyRotateWithDatabaseStorage(t *testing.T, flags keyRotateFlags, wantEr
+ 		}
+ 		return
+ 	}
+-
+ 	require.NoError(t, err)
+ 
+-	// Verify key was created
+-	key, err := keyProvider.LoadKey(t.Context())
++	// The new key must be the active generation of the persistent set
++	loaded, err := jwkutils.LoadSigningKeySet(t.Context(), db, envConfig, instanceID)
+ 	require.NoError(t, err)
++	key, gen := loaded.ActiveKey()
+ 	require.NotNil(t, key)
++	require.NotNil(t, gen)
++	assert.Nil(t, gen.RetiredAt, "Rotated-to generation must be active")
+ 
+-	// Verify the algorithm matches what we requested
+ 	alg, _ := key.Algorithm()
+ 	assert.NotEmpty(t, alg)
+ 	if flags.Alg != "" {
+ 		expectedAlg := flags.Alg
+ 		if expectedAlg == "EdDSA" {
+-			// EdDSA keys should have the EdDSA algorithm
+ 			assert.Equal(t, "EdDSA", alg.String())
+ 		} else {
+ 			assert.Equal(t, expectedAlg, alg.String())
+@@ -127,17 +130,17 @@ func TestKeyRotateSessionKey(t *testing.T) {
+ 	}
+ 
+ 	db := testingutils.NewDatabaseForTest(t)
+-
+ 	instanceID, err := instanceid.Load(t.Context(), db)
+ 	require.NoError(t, err)
+ 
+ 	// Seed both keys so we can check that only the session key is replaced
+-	keyProvider, err := jwkutils.GetKeyProvider(db, envConfig, instanceID)
+-	require.NoError(t, err)
+ 	signingKey, err := jwkutils.GenerateKey("ES256", "")
+ 	require.NoError(t, err)
+-	err = keyProvider.SaveKey(t.Context(), signingKey)
++	signingKeyProvider, err := jwkutils.GetKeyProvider(db, envConfig, instanceID)
++	require.NoError(t, err)
++	err = signingKeyProvider.SaveKey(t.Context(), signingKey)
+ 	require.NoError(t, err)
++	signingKeyID, _ := signingKey.KeyID()
+ 
+ 	sessionKeyProvider, err := jwkutils.GetSessionKeyProvider(db, envConfig, instanceID)
+ 	require.NoError(t, err)
+@@ -163,12 +166,10 @@ func TestKeyRotateSessionKey(t *testing.T) {
+ 	rotatedKeyID, _ := rotatedSessionKey.KeyID()
+ 	assert.NotEqual(t, originalKeyID, rotatedKeyID, "Session key should have been replaced")
+ 
+-	// The token signing key must be left untouched
+-	unchangedSigningKey, err := keyProvider.LoadKey(t.Context())
++	// The seeded signing key row must be left completely untouched, since only the session key was rotated
++	unchangedSigningKey, err := signingKeyProvider.LoadKey(t.Context())
+ 	require.NoError(t, err)
+ 	require.NotNil(t, unchangedSigningKey)
+-
+-	signingKeyID, _ := signingKey.KeyID()
+ 	unchangedSigningKeyID, _ := unchangedSigningKey.KeyID()
+ 	assert.Equal(t, signingKeyID, unchangedSigningKeyID, "Token signing key should not have been rotated")
+ }
+@@ -179,7 +180,6 @@ func TestKeyRotateDoesNotChangeSessionKey(t *testing.T) {
+ 	}
+ 
+ 	db := testingutils.NewDatabaseForTest(t)
+-
+ 	instanceID, err := instanceid.Load(t.Context(), db)
+ 	require.NoError(t, err)
+ 
+@@ -220,7 +220,6 @@ func TestKeyRotateMultipleAlgorithms(t *testing.T) {
+ 
+ 	for _, algo := range algorithms {
+ 		t.Run(algo.alg, func(t *testing.T) {
+-			// Test with database storage for all algorithms
+ 			testKeyRotateWithDatabaseStorage(t, keyRotateFlags{
+ 				Alg: algo.alg,
+ 				Crv: algo.crv,
+@@ -229,3 +228,55 @@ func TestKeyRotateMultipleAlgorithms(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestKeyRotateKeepsPreviousGenerationRetired(t *testing.T) {
++	envConfig := &common.EnvConfigSchema{
++		EncryptionKey: []byte("test-encryption-key-characters-long"),
++	}
++
++	db := testingutils.NewDatabaseForTest(t)
++	instanceID, err := instanceid.Load(t.Context(), db)
++	require.NoError(t, err)
++
++	// First rotation bootstraps the set with RS256
++	err = keyRotate(t.Context(), keyRotateFlags{Alg: "RS256", RetentionDays: 30, Yes: true}, db, instanceID, envConfig)
++	require.NoError(t, err)
++	first, err := jwkutils.LoadSigningKeySet(t.Context(), db, envConfig, instanceID)
++	require.NoError(t, err)
++	_, firstGen := first.ActiveKey()
++	require.NotNil(t, firstGen)
++	firstKid := firstGen.Kid
++
++	// Second rotation switches to ES256 and must retire the first generation atomically
++	err = keyRotate(t.Context(), keyRotateFlags{Alg: "ES256", RetentionDays: 30, Yes: true}, db, instanceID, envConfig)
++	require.NoError(t, err)
++	second, err := jwkutils.LoadSigningKeySet(t.Context(), db, envConfig, instanceID)
++	require.NoError(t, err)
++	require.Len(t, second.Set.Generations, 2)
++
++	_, activeGen := second.ActiveKey()
++	require.NotNil(t, activeGen)
++	assert.NotEqual(t, firstKid, activeGen.Kid)
++	assert.Equal(t, "ES256", activeGen.Alg)
++
++	var retired *jwkutils.SigningKeyGeneration
++	for i := range second.Set.Generations {
++		if second.Set.Generations[i].Kid == firstKid {
++			retired = &second.Set.Generations[i]
++			break
++		}
++	}
++	require.NotNil(t, retired, "First generation must be retained")
++	require.NotNil(t, retired.RetiredAt, "First generation must be marked retired")
++	require.NotNil(t, retired.RetainUntil, "First generation must have a retain-until deadline")
++	assert.WithinDuration(t, retired.RetiredAt.Add(30*24*time.Hour), *retired.RetainUntil, time.Minute, "Retention window must match the requested 30 days")
++
++	// Exactly one active generation must ever exist
++	activeCount := 0
++	for _, gen := range second.Set.Generations {
++		if gen.Active() {
++			activeCount++
++		}
++	}
++	assert.Equal(t, 1, activeCount, "There must be exactly one active generation")
++}
+diff --git a/backend/internal/controller/well_known_controller.go b/backend/internal/controller/well_known_controller.go
+index 187847ba..a56d46c7 100644
+--- a/backend/internal/controller/well_known_controller.go
++++ b/backend/internal/controller/well_known_controller.go
+@@ -87,9 +87,10 @@ func (wkc *WellKnownController) computeServerMetadata() ([]byte, error) {
+ 
+ 	internalAppUrl := common.EnvConfig.InternalAppURL
+ 
+-	alg, err := wkc.jwtService.GetKeyAlg()
++	// Advertise the algorithm of the active key and every retired key still published, so apps keep accepting rotated keys
++	algs, err := wkc.jwtService.GetKeyAlgorithms()
+ 	if err != nil {
+-		return nil, fmt.Errorf("failed to get key algorithm: %w", err)
++		return nil, fmt.Errorf("failed to get key algorithms: %w", err)
+ 	}
+ 	cimdSupported := false
+ 	if wkc.getCIMDURLAllowlist != nil {
+@@ -112,7 +113,7 @@ func (wkc *WellKnownController) computeServerMetadata() ([]byte, error) {
+ 		"response_types_supported":                       []string{"code"},
+ 		"response_modes_supported":                       []string{"query", "fragment", "form_post"},
+ 		"subject_types_supported":                        []string{"public"},
+-		"id_token_signing_alg_values_supported":          []string{alg.String()},
++		"id_token_signing_alg_values_supported":          algs,
+ 		"authorization_response_iss_parameter_supported": true,
+ 		"code_challenge_methods_supported":               []string{"plain", "S256"},
+ 		"request_parameter_supported":                    true,
+diff --git a/backend/internal/oidc/end_session_service.go b/backend/internal/oidc/end_session_service.go
+index 6680f76d..212b9179 100644
+--- a/backend/internal/oidc/end_session_service.go
++++ b/backend/internal/oidc/end_session_service.go
+@@ -95,20 +95,32 @@ func (s *endSessionService) endSession(ctx context.Context, input dto.OidcLogout
+ }
+ 
+ func (s *endSessionService) verifyIDTokenHint(tokenString string) (jwt.Token, error) {
+-	alg, err := s.signer.GetKeyAlg()
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	token, err := jwt.ParseString(
+-		tokenString,
++	// A signer with multiple generations verifies by the token's kid, so ID tokens signed before a rotation keep working
++	parseOptions := []jwt.ParseOption{
+ 		jwt.WithValidate(true),
+-		jwt.WithKey(alg, s.signer.GetPrivateKey()),
+ 		jwt.WithAcceptableSkew(time.Minute),
+ 		jwt.WithResetValidators(true),
+ 		jwt.WithIssuer(s.baseURL),
+ 		jwt.WithValidator(jwt.IsIssuedAtValid()),
+ 		jwt.WithValidator(jwt.IsNbfValid()),
++	}
++	if resolver, ok := s.signer.(KeySetResolver); ok {
++		keySet, err := resolver.GetVerificationKeySet()
++		if err != nil {
++			return nil, err
++		}
++		parseOptions = append(parseOptions, jwt.WithKeySet(keySet))
++	} else {
++		alg, err := s.signer.GetKeyAlg()
++		if err != nil {
++			return nil, err
++		}
++		parseOptions = append(parseOptions, jwt.WithKey(alg, s.signer.GetPrivateKey()))
++	}
++
++	token, err := jwt.ParseString(
++		tokenString,
++		parseOptions...,
+ 	)
+ 	if err != nil {
+ 		return nil, err
+diff --git a/backend/internal/oidc/module.go b/backend/internal/oidc/module.go
+index 9ce6f646..3fee0a0d 100644
+--- a/backend/internal/oidc/module.go
++++ b/backend/internal/oidc/module.go
+@@ -9,6 +9,7 @@ import (
+ 
+ 	francishost "github.com/italypaleale/francis/host"
+ 	"github.com/lestrrat-go/jwx/v4/jwa"
++	"github.com/lestrrat-go/jwx/v4/jwk"
+ 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+ 	"gorm.io/gorm"
+ 
+@@ -30,6 +31,17 @@ type TokenSigner interface {
+ 	GetKeyID() (string, bool)
+ }
+ 
++// VerificationKeyResolver is implemented by signers that can verify tokens by kid against multiple key generations
++// Tokens signed by a retired generation must keep verifying for as long as the key stays in the JWKS
++type VerificationKeyResolver interface {
++	GetVerificationKey(kid string) (any, bool)
++}
++
++// KeySetResolver is implemented by signers that expose every public key a token may be verified against, including retired generations
++type KeySetResolver interface {
++	GetVerificationKeySet() (jwk.Set, error)
++}
++
+ type CustomClaimSource interface {
+ 	GetCustomClaimsForUserWithUserGroups(ctx context.Context, userID string, tx *gorm.DB) ([]model.CustomClaim, error)
+ }
+diff --git a/backend/internal/oidc/provider.go b/backend/internal/oidc/provider.go
+index 9408918b..c2ac815a 100644
+--- a/backend/internal/oidc/provider.go
++++ b/backend/internal/oidc/provider.go
+@@ -64,7 +64,12 @@ func newProvider(store *Store, authenticator *federatedClientAuthenticator, sign
+ 	keyGetter := func(context.Context) (interface{}, error) {
+ 		return SigningKeyFromSigner(signer)
+ 	}
+-	sig := newJWTSigner(keyGetter)
++	// Resolve verification keys by kid so retired generations still validate tokens after rotation
++	var resolveVerificationKey func(kid string) (any, bool)
++	if resolver, ok := signer.(VerificationKeyResolver); ok {
++		resolveVerificationKey = resolver.GetVerificationKey
++	}
++	sig := newJWTSigner(keyGetter, resolveVerificationKey)
+ 	deviceStrategy := &deviceStrategy{DefaultDeviceStrategy: compose.NewDeviceStrategy(fositeConfig)}
+ 	rfc9068AccessTokenStrategy := &fositeoauth2.RFC9068JWTStrategy{
+ 		DefaultJWTStrategy: &fositeoauth2.DefaultJWTStrategy{
+diff --git a/backend/internal/oidc/signer.go b/backend/internal/oidc/signer.go
+index f0408c42..29b533be 100644
+--- a/backend/internal/oidc/signer.go
++++ b/backend/internal/oidc/signer.go
+@@ -39,11 +39,15 @@ func SigningKeyFromSigner(signer TokenSigner) (*jose.JSONWebKey, error) {
+ 
+ type jwtSigner struct {
+ 	*fositejwt.DefaultSigner
++	// resolveVerificationKey looks up the public key of active and still-compatible retired generations by kid
++	// It may be nil for signers that only expose the active key, such as minimal test doubles
++	resolveVerificationKey func(kid string) (any, bool)
+ }
+ 
+-func newJWTSigner(keyGetter fositejwt.GetPrivateKeyFunc) *jwtSigner {
++func newJWTSigner(keyGetter fositejwt.GetPrivateKeyFunc, resolveVerificationKey func(kid string) (any, bool)) *jwtSigner {
+ 	return &jwtSigner{
+-		DefaultSigner: &fositejwt.DefaultSigner{GetPrivateKey: keyGetter},
++		DefaultSigner:          &fositejwt.DefaultSigner{GetPrivateKey: keyGetter},
++		resolveVerificationKey: resolveVerificationKey,
+ 	}
+ }
+ 
+@@ -55,17 +59,27 @@ func (s *jwtSigner) Validate(ctx context.Context, token string) (string, error)
+ }
+ 
+ func (s *jwtSigner) Decode(ctx context.Context, token string) (*fositejwt.Token, error) {
++	// The active key doubles as the fallback for tokens without a kid and for test signers
+ 	key, err := s.GetPrivateKey(ctx)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+-	verificationKey := key
+-	if jsonWebKey, ok := key.(*jose.JSONWebKey); ok {
+-		verificationKey = new(jsonWebKey.Public())
+-	}
++	return fositejwt.Parse(token, func(parsed *fositejwt.Token) (any, error) {
++		// Pick the public key matching the token's kid so tokens signed by a retired-but-still-valid generation verify
++		if s.resolveVerificationKey != nil {
++			if kid, _ := parsed.Header["kid"].(string); kid != "" {
++				if verificationKey, ok := s.resolveVerificationKey(kid); ok {
++					return verificationKey, nil
++				}
++			}
++		}
+ 
+-	return fositejwt.Parse(token, func(*fositejwt.Token) (any, error) {
++		verificationKey := key
++		if jsonWebKey, ok := key.(*jose.JSONWebKey); ok {
++			publicKey := jsonWebKey.Public()
++			return &publicKey, nil
++		}
+ 		return verificationKey, nil
+ 	})
+ }
+diff --git a/backend/internal/oidc/signer_test.go b/backend/internal/oidc/signer_test.go
+new file mode 100644
+index 00000000..d895e6e5
+--- /dev/null
++++ b/backend/internal/oidc/signer_test.go
+@@ -0,0 +1,104 @@
++package oidc
++
++import (
++	"context"
++	"crypto/ecdsa"
++	"crypto/elliptic"
++	"crypto/rand"
++	"strconv"
++	"testing"
++	"time"
++
++	jose "github.com/go-jose/go-jose/v4"
++	"github.com/stretchr/testify/require"
++)
++
++// newTestECKey generates an ECDSA P-256 key wrapped as a JOSE JSON Web Key with the given kid
++func newTestECKey(t *testing.T, kid string) *ecdsa.PrivateKey {
++	t.Helper()
++
++	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	require.NoError(t, err)
++	return key
++}
++
++func signCompact(t *testing.T, key *ecdsa.PrivateKey, kid string) string {
++	t.Helper()
++
++	jwk := &jose.JSONWebKey{Key: key, KeyID: kid, Algorithm: string(jose.ES256)}
++	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.ES256, Key: jwk}, nil)
++	require.NoError(t, err)
++
++	claims := `{"sub":"user-1","exp":` + currentUnixPlusOneHour(t) + `}`
++	obj, err := signer.Sign([]byte(claims))
++	require.NoError(t, err)
++	serialized, err := obj.CompactSerialize()
++	require.NoError(t, err)
++	return serialized
++}
++
++func currentUnixPlusOneHour(t *testing.T) string {
++	t.Helper()
++	return strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10)
++}
++
++func TestJWTSignerDecodesByKid(t *testing.T) {
++	active := newTestECKey(t, "active")
++	retired := newTestECKey(t, "retired")
++	unknown := newTestECKey(t, "unknown")
++
++	keyGetter := func(context.Context) (any, error) {
++		return &jose.JSONWebKey{Key: active, KeyID: "active", Algorithm: string(jose.ES256)}, nil
++	}
++	resolve := func(kid string) (any, bool) {
++		switch kid {
++		case "active":
++			return &active.PublicKey, true
++		case "retired":
++			return &retired.PublicKey, true
++		default:
++			return nil, false
++		}
++	}
++	signer := newJWTSigner(keyGetter, resolve)
++
++	// Tokens from the active generation verify
++	activeToken := signCompact(t, active, "active")
++	_, err := signer.Decode(t.Context(), activeToken)
++	require.NoError(t, err, "The active generation must verify")
++
++	// Tokens signed before a rotation by a retired-but-published generation verify through the kid resolver
++	retiredToken := signCompact(t, retired, "retired")
++	decoded, err := signer.Decode(t.Context(), retiredToken)
++	require.NoError(t, err, "A token with a retired kid still in the JWKS window must verify")
++	require.Equal(t, "retired", decoded.Header["kid"])
++
++	// A kid that is neither active nor published must not fall back to the active key
++	unknownToken := signCompact(t, unknown, "unknown")
++	_, err = signer.Decode(t.Context(), unknownToken)
++	require.Error(t, err, "An unknown kid must fail verification")
++
++	// Validate returns the signature when verification succeeds
++	signature, err := signer.Validate(t.Context(), retiredToken)
++	require.NoError(t, err)
++	require.NotEmpty(t, signature)
++}
++
++func TestJWTSignerWithoutResolverFallsBackToActiveKey(t *testing.T) {
++	active := newTestECKey(t, "active")
++	retired := newTestECKey(t, "retired")
++
++	keyGetter := func(context.Context) (any, error) {
++		return &jose.JSONWebKey{Key: active, KeyID: "active", Algorithm: string(jose.ES256)}, nil
++	}
++	// Signers without generations (test doubles) keep the legacy behavior: verify with the active key only
++	signer := newJWTSigner(keyGetter, nil)
++
++	activeToken := signCompact(t, active, "active")
++	_, err := signer.Decode(t.Context(), activeToken)
++	require.NoError(t, err)
++
++	retiredToken := signCompact(t, retired, "retired")
++	_, err = signer.Decode(t.Context(), retiredToken)
++	require.Error(t, err, "Without a resolver only the active key can verify")
++}
+diff --git a/backend/internal/service/jwt_service.go b/backend/internal/service/jwt_service.go
+index cf3fac1f..932f249b 100644
+--- a/backend/internal/service/jwt_service.go
++++ b/backend/internal/service/jwt_service.go
+@@ -6,6 +6,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"log/slog"
++	"sync/atomic"
+ 	"time"
+ 	"uuid"
+ 
+@@ -52,18 +53,34 @@ const (
+ 
+ 	// Acceptable clock skew for verifying tokens
+ 	clockSkew = time.Minute
++
++	// signingKeyReloadInterval is how often a running instance picks up rotations performed by the key-rotate command or another instance
++	signingKeyReloadInterval = 30 * time.Second
+ )
+ 
++// signingKeyState is an immutable snapshot of everything token signing and verification need
++// It is replaced atomically when the persistent signing key set changes, so requests never observe a half-switched key
++type signingKeyState struct {
++	// activePrivate is the private key of the active generation and signs new tokens
++	activePrivate jwk.Key
++	// keyID is the kid of the active generation
++	keyID string
++	// alg is the algorithm of the active generation
++	alg jwa.KeyAlgorithm
++	// jwksEncoded is the published JWKS: the active public key plus every retired key still within its compatibility window
++	jwksEncoded []byte
++	// publicKeys is the same set as jwksEncoded in programmatic form, used to verify tokens by kid
++	publicKeys jwk.Set
++}
++
+ type JwtService struct {
+ 	db        *gorm.DB
+ 	envConfig *common.EnvConfigSchema
+-	// privateKey signs tokens that are consumed externally, such as ID tokens and access tokens for apps
+-	privateKey jwk.Key
++	// state is the active signing generation plus every still-published retired generation
++	state atomic.Pointer[signingKeyState]
+ 	// sessionKey is the symmetric key that signs Pocket ID's own session tokens
+-	sessionKey  jwk.Key
+-	keyId       string
+-	instanceID  string
+-	jwksEncoded []byte
++	sessionKey jwk.Key
++	instanceID string
+ }
+ 
+ func NewJwtService(ctx context.Context, db *gorm.DB, instanceID string) (*JwtService, error) {
+@@ -88,13 +105,13 @@ func (s *JwtService) init(ctx context.Context, db *gorm.DB, instanceID string, e
+ 
+ // LoadOrGenerateKey loads the signing keys from the database, generating and persisting them if they don't exist yet
+ func (s *JwtService) LoadOrGenerateKey(ctx context.Context) error {
+-	// Load the key used for tokens that are consumed externally, such as ID tokens and access tokens for apps
+-	err := retryKeyStorage(ctx, s.loadOrGenerateSigningKey)
++	// Load the persistent set used for tokens that are consumed externally, such as ID tokens and access tokens for apps
++	err := retryKeyStorage(ctx, s.loadOrGenerateSigningKeySet)
+ 	if err != nil {
+ 		return fmt.Errorf("error loading signing key: %w", err)
+ 	}
+ 
+-	// Load the key used for Pocket ID's own sessions, which is symmetric
++	// Load the key used for Pocket ID's own sessions, which is symmetric and lives in its own kv row
+ 	err = retryKeyStorage(ctx, s.loadOrGenerateSessionKey)
+ 	if err != nil {
+ 		return fmt.Errorf("error loading session key: %w", err)
+@@ -125,41 +142,13 @@ func retryKeyStorage(ctx context.Context, loadOrGenerate func(context.Context) e
+ 	}
+ }
+ 
+-func (s *JwtService) loadOrGenerateSigningKey(ctx context.Context) error {
+-	// Get the key provider
+-	keyProvider, err := jwkutils.GetKeyProvider(s.db, s.envConfig, s.instanceID)
++// loadOrGenerateSigningKeySet loads the persistent generation set, adopting the legacy single key or generating the first one
++func (s *JwtService) loadOrGenerateSigningKeySet(ctx context.Context) error {
++	loaded, err := jwkutils.EnsureSigningKeySet(ctx, s.db, s.envConfig, s.instanceID, time.Now())
+ 	if err != nil {
+-		return fmt.Errorf("failed to get key provider: %w", err)
+-	}
+-
+-	// Try loading a key
+-	key, err := keyProvider.LoadKey(ctx)
+-	if err != nil {
+-		return fmt.Errorf("failed to load key: %w", err)
+-	}
+-
+-	// If we have a key, store it in the object and we're done
+-	if key != nil {
+-		err = s.SetKey(key)
+-		if err != nil {
+-			return fmt.Errorf("failed to set private key: %w", err)
+-		}
+-		return nil
++		return err
+ 	}
+-
+-	// If we are here, we need to generate a new key
+-	err = s.generateKey()
+-	if err != nil {
+-		return fmt.Errorf("failed to generate key: %w", err)
+-	}
+-
+-	// Save the newly-generated key
+-	err = keyProvider.SaveKey(ctx, s.privateKey)
+-	if err != nil {
+-		return fmt.Errorf("failed to save private key: %w", err)
+-	}
+-
+-	return nil
++	return s.applySigningKeySet(loaded, time.Now())
+ }
+ 
+ func (s *JwtService) loadOrGenerateSessionKey(ctx context.Context) error {
+@@ -205,23 +194,108 @@ func (s *JwtService) loadOrGenerateSessionKey(ctx context.Context) error {
+ 	return nil
+ }
+ 
+-// generateKey generates a new key and stores it in the object
+-func (s *JwtService) generateKey() error {
+-	// Default is to generate RS256 (RSA-2048) keys
+-	key, err := jwkutils.GenerateKey(jwa.RS256().String(), "")
++// applySigningKeySet builds an immutable snapshot from a decrypted persistent set and swaps it in atomically
++// Retired generations past their retain-until deadline are kept for local verification only after the cleanup job removes them; here they are simply not published
++func (s *JwtService) applySigningKeySet(loaded *jwkutils.LoadedSigningKeySet, now time.Time) error {
++	activeKey, activeGen := loaded.ActiveKey()
++	if activeKey == nil {
++		return errors.New("persisted signing key set has no active generation")
++	}
++	if err := ValidateKey(activeKey); err != nil {
++		return fmt.Errorf("active signing key is not valid: %w", err)
++	}
++
++	alg, ok := activeKey.Algorithm()
++	if !ok || alg == nil {
++		return errors.New("active signing key has no algorithm")
++	}
++
++	// Public keys are published with the active generation first, then the still-valid retired generations
++	publicSet := jwk.NewSet()
++	added := make(map[string]struct{}, len(loaded.Set.Generations))
++
++	activePublic, err := publicJWK(activeKey)
+ 	if err != nil {
+-		return fmt.Errorf("failed to generate new private key: %w", err)
++		return err
++	}
++	if err := publicSet.AddKey(activePublic); err != nil {
++		return fmt.Errorf("failed to add active public key to JWKS: %w", err)
+ 	}
++	added[activeGen.Kid] = struct{}{}
+ 
+-	// Set the key in the object, which also validates it
+-	err = s.SetKey(key)
++	for _, gen := range orderedRetiredGenerations(loaded.Set, now) {
++		privateKey, ok := loaded.Keys[gen.Kid]
++		if !ok {
++			return fmt.Errorf("private key for retired generation %q is not available", gen.Kid)
++		}
++		publicKey, err := publicJWK(privateKey)
++		if err != nil {
++			return fmt.Errorf("failed to get public key for retired generation %q: %w", gen.Kid, err)
++		}
++		if _, exists := added[gen.Kid]; exists {
++			continue
++		}
++		if err := publicSet.AddKey(publicKey); err != nil {
++			return fmt.Errorf("failed to add retired public key %q to JWKS: %w", gen.Kid, err)
++		}
++		added[gen.Kid] = struct{}{}
++	}
++
++	jwksEncoded, err := json.Marshal(publicSet)
+ 	if err != nil {
+-		return fmt.Errorf("failed to set private key: %w", err)
++		return fmt.Errorf("failed to encode JWKS to JSON: %w", err)
++	}
++
++	newState := &signingKeyState{
++		activePrivate: activeKey,
++		keyID:         activeGen.Kid,
++		alg:           alg,
++		jwksEncoded:   jwksEncoded,
++		publicKeys:    publicSet,
+ 	}
+ 
++	previous := s.state.Swap(newState)
++	if previous == nil || previous.keyID != newState.keyID {
++		slog.Info("Active OIDC signing key", slog.String("kid", newState.keyID), slog.String("alg", alg.String()), slog.Int("published_keys", publicSet.Len()))
++	}
+ 	return nil
+ }
+ 
++// orderedRetiredGenerations returns generations that are neither active nor expired, most recently retired first
++func orderedRetiredGenerations(set *jwkutils.SigningKeySet, now time.Time) []jwkutils.SigningKeyGeneration {
++	retired := make([]jwkutils.SigningKeyGeneration, 0, len(set.Generations))
++	for _, gen := range set.Generations {
++		if gen.Active() || gen.Expired(now) {
++			continue
++		}
++		retired = append(retired, gen)
++	}
++	// Sort without importing slices to keep the dependency surface small
++	for i := 0; i < len(retired); i++ {
++		for j := i + 1; j < len(retired); j++ {
++			if retired[j].RetiredAt != nil && (retired[i].RetiredAt == nil || retired[j].RetiredAt.After(*retired[i].RetiredAt)) {
++				retired[i], retired[j] = retired[j], retired[i]
++			}
++		}
++	}
++	return retired
++}
++
++// publicJWK derives the asymmetric public key published in the JWKS, carrying the key id and algorithm
++func publicJWK(privateKey jwk.Key) (jwk.Key, error) {
++	isPrivate, err := jwk.IsPrivateKey(privateKey)
++	if err != nil || !isPrivate {
++		// Defense in depth: a symmetric or already-public key can never be part of the external JWKS
++		return nil, errors.New("signing key is not an asymmetric private key")
++	}
++	publicKey, err := privateKey.PublicKey()
++	if err != nil {
++		return nil, fmt.Errorf("failed to get public key: %w", err)
++	}
++	jwkutils.EnsureAlgInKey(publicKey, "", "")
++	return publicKey, nil
++}
++
+ func ValidateKey(privateKey jwk.Key) error {
+ 	// Validate the loaded key
+ 	err := privateKey.Validate()
+@@ -272,6 +346,8 @@ func ValidateSessionKey(sessionKey jwk.Key) error {
+ 	return nil
+ }
+ 
++// SetKey sets a single key as the active signing key
++// It is used when no persistent set is involved, for example in minimal controllers and tests
+ func (s *JwtService) SetKey(privateKey jwk.Key) error {
+ 	// Validate the loaded key
+ 	err := ValidateKey(privateKey)
+@@ -279,30 +355,35 @@ func (s *JwtService) SetKey(privateKey jwk.Key) error {
+ 		return fmt.Errorf("private key is not valid: %w", err)
+ 	}
+ 
+-	// Set the private key and key id in the object
+-	s.privateKey = privateKey
+-
+-	keyId, ok := privateKey.KeyID()
+-	if !ok {
++	kid, ok := privateKey.KeyID()
++	if !ok || kid == "" {
+ 		return errors.New("key object does not contain a key ID")
+ 	}
+-	s.keyId = keyId
++	alg, ok := privateKey.Algorithm()
++	if !ok || alg == nil {
++		return errors.New("key object does not contain an algorithm")
++	}
+ 
+-	// Create and encode a JWKS containing the public key
+-	publicKey, err := s.GetPublicJWK()
++	publicKey, err := publicJWK(privateKey)
+ 	if err != nil {
+-		return fmt.Errorf("failed to get public JWK: %w", err)
++		return err
+ 	}
+-	jwks := jwk.NewSet()
+-	err = jwks.AddKey(publicKey)
+-	if err != nil {
++	publicSet := jwk.NewSet()
++	if err := publicSet.AddKey(publicKey); err != nil {
+ 		return fmt.Errorf("failed to add public key to JWKS: %w", err)
+ 	}
+-	s.jwksEncoded, err = json.Marshal(jwks)
++	jwksEncoded, err := json.Marshal(publicSet)
+ 	if err != nil {
+ 		return fmt.Errorf("failed to encode JWKS to JSON: %w", err)
+ 	}
+ 
++	s.state.Store(&signingKeyState{
++		activePrivate: privateKey,
++		keyID:         kid,
++		alg:           alg,
++		jwksEncoded:   jwksEncoded,
++		publicKeys:    publicSet,
++	})
+ 	return nil
+ }
+ 
+@@ -319,6 +400,15 @@ func (s *JwtService) SetSessionKey(sessionKey jwk.Key) error {
+ 	return nil
+ }
+ 
++// currentState returns the active signing snapshot or an error when the signer is not initialized
++func (s *JwtService) currentState() (*signingKeyState, error) {
++	state := s.state.Load()
++	if state == nil {
++		return nil, errors.New("key is not initialized")
++	}
++	return state, nil
++}
++
+ func (s *JwtService) GenerateAccessToken(user model.User, authenticationMethod string, sessionDuration time.Duration) (string, error) {
+ 	if s.sessionKey == nil {
+ 		return "", errors.New("session key is not initialized")
+@@ -362,6 +452,11 @@ func (s *JwtService) GenerateAccessToken(user model.User, authenticationMethod s
+ // GenerateLogoutToken creates a logout token for OIDC Back-Channel Logout 1.0
+ // The token identifies the user with a "sub" claim only, as Pocket ID does not track per-session "sid" values
+ func (s *JwtService) GenerateLogoutToken(userID string, clientID string) (string, error) {
++	state, err := s.currentState()
++	if err != nil {
++		return "", err
++	}
++
+ 	now := time.Now()
+ 	token, err := jwt.NewBuilder().
+ 		Subject(userID).
+@@ -383,12 +478,7 @@ func (s *JwtService) GenerateLogoutToken(userID string, clientID string) (string
+ 		return "", fmt.Errorf("failed to set 'typ' header: %w", err)
+ 	}
+ 
+-	alg, err := s.GetKeyAlg()
+-	if err != nil {
+-		return "", err
+-	}
+-
+-	signed, err := jwt.Sign(token, jwt.WithKey(alg, s.privateKey, jws.WithProtectedHeaders(headers)))
++	signed, err := jwt.Sign(token, jwt.WithKey(state.alg, state.activePrivate, jws.WithProtectedHeaders(headers)))
+ 	if err != nil {
+ 		return "", fmt.Errorf("failed to sign token: %w", err)
+ 	}
+@@ -441,52 +531,157 @@ func (s *JwtService) VerifyAccessToken(tokenString string) (jwt.Token, error) {
+ 	)
+ }
+ 
+-// GetPublicJWK returns the JSON Web Key (JWK) for the public key.
++// GetPublicJWK returns the JSON Web Key (JWK) for the active public key
+ func (s *JwtService) GetPublicJWK() (jwk.Key, error) {
+-	if s.privateKey == nil {
+-		return nil, errors.New("key is not initialized")
++	state, err := s.currentState()
++	if err != nil {
++		return nil, err
+ 	}
++	return publicJWK(state.activePrivate)
++}
+ 
+-	pubKey, err := s.privateKey.PublicKey()
++// GetPublicJWKSAsJSON returns the JWKS used for token verification, encoded as JSON
++// It contains the active public key and every retired public key still within its compatibility window
++// The value is cached per snapshot and only rebuilt when the persistent set changes
++func (s *JwtService) GetPublicJWKSAsJSON() ([]byte, error) {
++	state, err := s.currentState()
+ 	if err != nil {
+-		return nil, fmt.Errorf("failed to get public key: %w", err)
++		return nil, err
++	}
++	return state.jwksEncoded, nil
++}
++
++// GetKeyAlg returns the algorithm of the active signing key
++func (s *JwtService) GetKeyAlg() (jwa.KeyAlgorithm, error) {
++	state, err := s.currentState()
++	if err != nil {
++		return nil, err
++	}
++	return state.alg, nil
++}
++
++// GetKeyAlgorithms returns the distinct algorithms of every published key, active first
++// Retired keys stay published during their compatibility window, so discovery must advertise their algorithms too
++func (s *JwtService) GetKeyAlgorithms() ([]string, error) {
++	state, err := s.currentState()
++	if err != nil {
++		return nil, err
+ 	}
+ 
+-	jwkutils.EnsureAlgInKey(pubKey, "", "")
++	algs := make([]string, 0, state.publicKeys.Len())
++	seen := make(map[string]struct{}, state.publicKeys.Len())
++	for i := range state.publicKeys.Len() {
++		key, ok := state.publicKeys.Key(i)
++		if !ok {
++			continue
++		}
++		alg, ok := key.Algorithm()
++		if !ok || alg == nil {
++			continue
++		}
++		name := alg.String()
++		if _, exists := seen[name]; exists {
++			continue
++		}
++		seen[name] = struct{}{}
++		algs = append(algs, name)
++	}
++	if len(algs) == 0 {
++		return nil, errors.New("no signing algorithm is published")
++	}
++	return algs, nil
++}
+ 
+-	return pubKey, nil
++// GetKeyID returns the key ID (kid) of the active signing key, if one is set
++func (s *JwtService) GetKeyID() (string, bool) {
++	state := s.state.Load()
++	if state == nil {
++		return "", false
++	}
++	return state.keyID, true
+ }
+ 
+-// GetPublicJWKSAsJSON returns the JSON Web Key Set (JWKS) for the public key, encoded as JSON.
+-// The value is cached since the key is static.
+-func (s *JwtService) GetPublicJWKSAsJSON() ([]byte, error) {
+-	if len(s.jwksEncoded) == 0 {
+-		return nil, errors.New("key is not initialized")
++// GetVerificationKeySet returns the public keys used to verify OIDC tokens by kid
++// The set never contains private keys or the symmetric session key
++func (s *JwtService) GetVerificationKeySet() (jwk.Set, error) {
++	state, err := s.currentState()
++	if err != nil {
++		return nil, err
+ 	}
++	return state.publicKeys, nil
++}
+ 
+-	return s.jwksEncoded, nil
++// GetVerificationKey returns the raw public key for a kid, used by the internal JWT signer when verifying tokens by their "kid" header
++// An unknown kid falls back to the caller, which should reject the token
++func (s *JwtService) GetVerificationKey(kid string) (any, bool) {
++	state := s.state.Load()
++	if state == nil || kid == "" {
++		return nil, false
++	}
++	pubKey, ok := state.publicKeys.LookupKeyID(kid)
++	if !ok {
++		return nil, false
++	}
++	rawKey, err := jwk.Export[any](pubKey)
++	if err != nil {
++		return nil, false
++	}
++	return rawKey, true
+ }
+ 
+-// GetKeyAlg returns the algorithm of the key
+-func (s *JwtService) GetKeyAlg() (jwa.KeyAlgorithm, error) {
+-	if len(s.jwksEncoded) == 0 {
+-		return nil, errors.New("key is not initialized")
++// ActivePrivateKey returns the private key of the active generation, mainly for diagnostics and tests
++func (s *JwtService) ActivePrivateKey() jwk.Key {
++	state := s.state.Load()
++	if state == nil {
++		return nil
+ 	}
++	return state.activePrivate
++}
+ 
+-	alg, ok := s.privateKey.Algorithm()
+-	if !ok || alg == nil {
+-		return nil, errors.New("failed to retrieve algorithm for key")
++// ReloadSigningKeys refreshes the in-memory snapshot from the persistent set without generating anything
++// It is used by running instances to pick up rotations performed by the key-rotate command or another instance
++func (s *JwtService) ReloadSigningKeys(ctx context.Context) error {
++	loaded, err := jwkutils.LoadSigningKeySet(ctx, s.db, s.envConfig, s.instanceID)
++	if err != nil {
++		return fmt.Errorf("failed to reload signing key set: %w", err)
+ 	}
++	return s.applySigningKeySet(loaded, time.Now())
++}
+ 
+-	return alg, nil
++// RunSigningKeyReloader periodically reloads the persistent signing key set until the context is canceled
++func (s *JwtService) RunSigningKeyReloader(ctx context.Context) error {
++	ticker := time.NewTicker(signingKeyReloadInterval)
++	defer ticker.Stop()
++
++	for {
++		select {
++		case <-ctx.Done():
++			return nil
++		case <-ticker.C:
++			if err := s.ReloadSigningKeys(ctx); err != nil {
++				// Keep serving with the previous snapshot: it still signs new tokens and the next tick retries
++				slog.WarnContext(ctx, "Failed to reload OIDC signing key set, keeping current keys", slog.Any("error", err))
++			}
++		}
++	}
+ }
+ 
+-// GetKeyID returns the key ID (kid) of the signing key, if one is set.
+-func (s *JwtService) GetKeyID() (string, bool) {
+-	if s.privateKey == nil {
+-		return "", false
++// CleanupExpiredRetiredKeys removes generations whose compatibility window has elapsed, then refreshes the snapshot
++// Removal is atomic and failure leaves everything in place, so the next scheduled run can retry safely
++func (s *JwtService) CleanupExpiredRetiredKeys(ctx context.Context) (int, error) {
++	removed, err := jwkutils.PruneRetiredSigningKeys(ctx, s.db, s.envConfig, s.instanceID, time.Now())
++	if err != nil {
++		return 0, err
++	}
++	if len(removed) == 0 {
++		return 0, nil
+ 	}
+-	return s.privateKey.KeyID()
++
++	if err := s.ReloadSigningKeys(ctx); err != nil {
++		// The prune is already committed; a failed refresh only delays dropping the keys from the JWKS
++		slog.WarnContext(ctx, "Removed retired signing keys but failed to refresh JWKS snapshot", slog.Any("error", err))
++	}
++	return len(removed), nil
+ }
+ 
+ // GetAuthenticationMethod returns the first authentication method in the "amr" claim in the token
+@@ -496,7 +691,7 @@ func (s *JwtService) GetAuthenticationMethod(token jwt.Token) (string, error) {
+ 	}
+ 	rawAuthenticationMethods, err := jwt.Get[[]any](token, common.AuthenticationMethodsClaim)
+ 	if err != nil {
+-		return "", fmt.Errorf("failed to get '%s' claim from token: %w", common.AuthenticationMethodsClaim, err)
++		return "", fmt.Errorf("failed to get '%s' claim: %w", common.AuthenticationMethodsClaim, err)
+ 	}
+ 
+ 	if len(rawAuthenticationMethods) == 0 {
+@@ -554,7 +749,12 @@ func TokenTypeValidator(expectedTokenType string) jwt.ValidatorFunc {
+ 	}
+ }
+ 
++// GetPrivateKey returns the raw private key of the active generation for the fosite signer
+ func (s *JwtService) GetPrivateKey() any {
+-	privateKey, _ := jwk.Export[any](s.privateKey)
++	state := s.state.Load()
++	if state == nil {
++		return nil
++	}
++	privateKey, _ := jwk.Export[any](state.activePrivate)
+ 	return privateKey
+ }
+diff --git a/backend/internal/service/jwt_service_test.go b/backend/internal/service/jwt_service_test.go
+index 0362f01b..2ea1eb44 100644
+--- a/backend/internal/service/jwt_service_test.go
++++ b/backend/internal/service/jwt_service_test.go
+@@ -6,9 +6,7 @@ import (
+ 	"crypto/ed25519"
+ 	"crypto/elliptic"
+ 	"crypto/rand"
+-	"crypto/rsa"
+ 	"errors"
+-	"sync"
+ 	"testing"
+ 	"time"
+ 
+@@ -102,21 +100,22 @@ func TestJwtService_Init(t *testing.T) {
+ 		service := initJwtService(t, db, instanceID, mockConfig, mockEnvConfig)
+ 
+ 		// Verify the private key was set
+-		require.NotNil(t, service.privateKey, "Private key should be set")
++		require.NotNil(t, service.ActivePrivateKey(), "Private key should be set")
+ 
+-		// Verify the key has been persisted in the database
+-		keyProvider, err := jwkutils.GetKeyProvider(db, mockEnvConfig, instanceID)
+-		require.NoError(t, err, "Failed to init key provider")
+-		key, err := keyProvider.LoadKey(t.Context())
+-		require.NoError(t, err, "Failed to load key from provider")
+-		require.NotNil(t, key, "Key should be present in the database")
++		// Verify the key has been persisted in the signing key set
++		loaded, err := jwkutils.LoadSigningKeySet(t.Context(), db, mockEnvConfig, instanceID)
++		require.NoError(t, err, "Failed to load signing key set")
++		activeKey, activeGen := loaded.ActiveKey()
++		require.NotNil(t, activeKey, "Active key should be present in the database")
++		require.NotNil(t, activeGen, "An active generation should be present")
++		assert.Nil(t, activeGen.RetiredAt, "The only generation should be active")
+ 
+ 		// Key should have required properties
+-		keyID, ok := key.KeyID()
++		keyID, ok := activeKey.KeyID()
+ 		assert.True(t, ok, "Key should have a key ID")
+ 		assert.NotEmpty(t, keyID)
+ 
+-		keyUsage, ok := key.KeyUsage()
++		keyUsage, ok := activeKey.KeyUsage()
+ 		assert.True(t, ok, "Key should have a key usage")
+ 		assert.Equal(t, KeyUsageSigning, keyUsage)
+ 	})
+@@ -130,14 +129,14 @@ func TestJwtService_Init(t *testing.T) {
+ 		firstService := initJwtService(t, db, instanceID, mockConfig, mockEnvConfig)
+ 
+ 		// Get the key ID of the first service
+-		origKeyID, ok := firstService.privateKey.KeyID()
++		origKeyID, ok := firstService.ActivePrivateKey().KeyID()
+ 		require.True(t, ok)
+ 
+ 		// Now create a new service that should load the existing key
+ 		secondService := initJwtService(t, db, instanceID, mockConfig, mockEnvConfig)
+ 
+ 		// Verify the loaded key has the same ID as the original
+-		loadedKeyID, ok := secondService.privateKey.KeyID()
++		loadedKeyID, ok := secondService.ActivePrivateKey().KeyID()
+ 		require.True(t, ok)
+ 		assert.Equal(t, origKeyID, loadedKeyID, "Loaded key should have the same ID as the original")
+ 	})
+@@ -154,12 +153,12 @@ func TestJwtService_Init(t *testing.T) {
+ 		svc := initJwtService(t, db, instanceID, mockConfig, mockEnvConfig)
+ 
+ 		// Ensure loaded key has the right algorithm
+-		alg, ok := svc.privateKey.Algorithm()
++		alg, ok := svc.ActivePrivateKey().Algorithm()
+ 		_ = assert.True(t, ok) &&
+ 			assert.Equal(t, jwa.ES256().String(), alg.String(), "Loaded key has the incorrect algorithm")
+ 
+ 		// Verify the loaded key has the same ID as the original
+-		loadedKeyID, ok := svc.privateKey.KeyID()
++		loadedKeyID, ok := svc.ActivePrivateKey().KeyID()
+ 		_ = assert.True(t, ok) &&
+ 			assert.Equal(t, origKeyID, loadedKeyID, "Loaded key should have the same ID as the original")
+ 	})
+@@ -176,21 +175,21 @@ func TestJwtService_Init(t *testing.T) {
+ 		svc := initJwtService(t, db, instanceID, mockConfig, mockEnvConfig)
+ 
+ 		// Ensure loaded key has the right algorithm and curve
+-		alg, ok := svc.privateKey.Algorithm()
++		alg, ok := svc.ActivePrivateKey().Algorithm()
+ 		_ = assert.True(t, ok) &&
+ 			assert.Equal(t, jwa.EdDSA().String(), alg.String(), "Loaded key has the incorrect algorithm")
+ 
+-		curve, err := jwk.Get[jwa.EllipticCurveAlgorithm](svc.privateKey, "crv")
++		curve, err := jwk.Get[jwa.EllipticCurveAlgorithm](svc.ActivePrivateKey(), "crv")
+ 		_ = assert.NoError(t, err, "Failed to get 'crv' claim") &&
+ 			assert.Equal(t, jwa.Ed25519().String(), curve.String(), "Curve does not match expected value")
+ 
+ 		// Verify the loaded key has the same ID as the original
+-		loadedKeyID, ok := svc.privateKey.KeyID()
++		loadedKeyID, ok := svc.ActivePrivateKey().KeyID()
+ 		_ = assert.True(t, ok) &&
+ 			assert.Equal(t, origKeyID, loadedKeyID, "Loaded key should have the same ID as the original")
+ 	})
+ 
+-	for _, dbKey := range []string{jwkutils.PrivateKeyDBKey, jwkutils.SessionKeyDBKey} {
++	for _, dbKey := range []string{jwkutils.SigningKeysDBKey, jwkutils.SessionKeyDBKey} {
+ 		t.Run("should not retry a failed database write for "+dbKey, func(t *testing.T) {
+ 			// Configure the database to fail the first attempt for the selected key
+ 			db := testutils.NewDatabaseForTest(t)
+@@ -297,7 +296,7 @@ func TestJwtService_SessionKey(t *testing.T) {
+ 
+ 		service := initJwtService(t, db, instanceID, mockConfig, mockEnvConfig)
+ 
+-		signingKeyID, ok := service.privateKey.KeyID()
++		signingKeyID, ok := service.ActivePrivateKey().KeyID()
+ 		require.True(t, ok)
+ 		sessionKeyID, ok := service.sessionKey.KeyID()
+ 		require.True(t, ok)
+@@ -494,10 +493,8 @@ func TestJwtService_GetPublicJWK(t *testing.T) {
+ 	})
+ 
+ 	t.Run("returns error when private key is not initialized", func(t *testing.T) {
+-		// Create a service with nil private key
+-		service := &JwtService{
+-			privateKey: nil,
+-		}
++		// Create a service with no loaded key
++		service := &JwtService{}
+ 
+ 		// Try to get the JWK
+ 		publicKey, err := service.GetPublicJWK()
+@@ -602,10 +599,10 @@ func TestGenerateVerifyAccessToken(t *testing.T) {
+ 	})
+ 
+ 	t.Run("works with Ed25519 keys", func(t *testing.T) {
+-		origKeyID := createEdDSAKeyJWK(t, db, instanceID, envConfig)
++		origKeyID := rotateSigningKeyForTest(t, db, instanceID, envConfig, jwa.EdDSA().String(), jwa.Ed25519().String())
+ 		service := initJwtService(t, db, instanceID, mockConfig, envConfig)
+ 
+-		loadedKeyID, ok := service.privateKey.KeyID()
++		loadedKeyID, ok := service.ActivePrivateKey().KeyID()
+ 		require.True(t, ok)
+ 		assert.Equal(t, origKeyID, loadedKeyID, "Loaded key should have the same ID as the original")
+ 
+@@ -641,10 +638,10 @@ func TestGenerateVerifyAccessToken(t *testing.T) {
+ 	})
+ 
+ 	t.Run("works with P-256 keys", func(t *testing.T) {
+-		origKeyID := createECDSAKeyJWK(t, db, instanceID, envConfig)
++		origKeyID := rotateSigningKeyForTest(t, db, instanceID, envConfig, jwa.ES256().String(), "")
+ 		service := initJwtService(t, db, instanceID, mockConfig, envConfig)
+ 
+-		loadedKeyID, ok := service.privateKey.KeyID()
++		loadedKeyID, ok := service.ActivePrivateKey().KeyID()
+ 		require.True(t, ok)
+ 		assert.Equal(t, origKeyID, loadedKeyID, "Loaded key should have the same ID as the original")
+ 
+@@ -679,11 +676,11 @@ func TestGenerateVerifyAccessToken(t *testing.T) {
+ 		assert.Equal(t, "ES256", alg.String(), "Algorithm should be ES256")
+ 	})
+ 
+-	t.Run("works with RSA-4096 keys", func(t *testing.T) {
+-		origKeyID := createRSA4096KeyJWK(t, db, instanceID, envConfig)
++	t.Run("works with RSA keys rotated to RS512", func(t *testing.T) {
++		origKeyID := rotateSigningKeyForTest(t, db, instanceID, envConfig, jwa.RS512().String(), "")
+ 		service := initJwtService(t, db, instanceID, mockConfig, envConfig)
+ 
+-		loadedKeyID, ok := service.privateKey.KeyID()
++		loadedKeyID, ok := service.ActivePrivateKey().KeyID()
+ 		require.True(t, ok)
+ 		assert.Equal(t, origKeyID, loadedKeyID, "Loaded key should have the same ID as the original")
+ 
+@@ -715,7 +712,7 @@ func TestGenerateVerifyAccessToken(t *testing.T) {
+ 		assert.Equal(t, jwa.RSA().String(), publicKey.KeyType().String(), "Key type should be RSA")
+ 		alg, ok := publicKey.Algorithm()
+ 		require.True(t, ok)
+-		assert.Equal(t, jwa.RS256().String(), alg.String(), "Algorithm should be RS256")
++		assert.Equal(t, jwa.RS512().String(), alg.String(), "Algorithm should be RS512")
+ 	})
+ }
+ 
+@@ -772,25 +769,13 @@ func importKey(t *testing.T, db *gorm.DB, instanceID string, envConfig *common.E
+ 	return saveKeyToDatabase(t, db, instanceID, envConfig, privateKey)
+ }
+ 
+-// Because generating a RSA-406 key isn't immediate, we pre-compute one
+-var (
+-	rsaKeyPrecomputed    *rsa.PrivateKey
+-	rsaKeyPrecomputeOnce sync.Once
+-)
+-
+-func createRSA4096KeyJWK(t *testing.T, db *gorm.DB, instanceID string, envConfig *common.EnvConfigSchema) string {
++// rotateSigningKeyForTest rotates the persistent signing key set to the requested algorithm and returns the new active kid
++func rotateSigningKeyForTest(t *testing.T, db *gorm.DB, instanceID string, envConfig *common.EnvConfigSchema, alg, crv string) string {
+ 	t.Helper()
+ 
+-	rsaKeyPrecomputeOnce.Do(func() {
+-		var err error
+-		rsaKeyPrecomputed, err = rsa.GenerateKey(rand.Reader, 4096)
+-		if err != nil {
+-			panic("failed to precompute RSA key: " + err.Error())
+-		}
+-	})
+-
+-	// Import as JWK and save it
+-	return importKey(t, db, instanceID, envConfig, rsaKeyPrecomputed)
++	result, err := jwkutils.RotateSigningKeys(t.Context(), db, envConfig, instanceID, alg, crv, jwkutils.DefaultRetiredSigningKeyRetention(), time.Now())
++	require.NoError(t, err, "Failed to rotate signing key")
++	return result.NewActiveKid
+ }
+ 
+ func createECDSAKeyJWK(t *testing.T, db *gorm.DB, instanceID string, envConfig *common.EnvConfigSchema) string {
+diff --git a/backend/internal/service/jwt_signing_generations_test.go b/backend/internal/service/jwt_signing_generations_test.go
+new file mode 100644
+index 00000000..53d1704f
+--- /dev/null
++++ b/backend/internal/service/jwt_signing_generations_test.go
+@@ -0,0 +1,272 @@
++package service
++
++import (
++	"crypto/ecdsa"
++	"crypto/ed25519"
++	"crypto/rsa"
++	"testing"
++	"time"
++
++	jwxjwa "github.com/lestrrat-go/jwx/v4/jwa"
++	jwxjwk "github.com/lestrrat-go/jwx/v4/jwk"
++	jwxjwt "github.com/lestrrat-go/jwx/v4/jwt"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"gorm.io/gorm"
++
++	"github.com/pocket-id/pocket-id/backend/internal/common"
++	"github.com/pocket-id/pocket-id/backend/internal/instanceid"
++	jwkutils "github.com/pocket-id/pocket-id/backend/internal/utils/jwk"
++	testutils "github.com/pocket-id/pocket-id/backend/internal/utils/testing"
++)
++
++// rotateAndReload rotates the signing key like the key-rotate command would, then forces the running service to reload it
++func rotateAndReload(t *testing.T, svc *JwtService, alg, crv string, retention time.Duration) jwkutils.RotationResult {
++	t.Helper()
++
++	result, err := jwkutils.RotateSigningKeys(t.Context(), svc.db, svc.envConfig, svc.instanceID, alg, crv, retention, time.Now())
++	require.NoError(t, err)
++	require.NoError(t, svc.ReloadSigningKeys(t.Context()), "The running signer must reload the rotated active generation")
++	return result
++}
++
++// expireRetiredGeneration rewrites the set so every retired generation's compatibility deadline is in the past
++func expireRetiredGeneration(t *testing.T, db *gorm.DB, envConfig *common.EnvConfigSchema, instanceID string) {
++	t.Helper()
++
++	store, err := jwkutils.GetSigningKeySetStore(db, envConfig, instanceID)
++	require.NoError(t, err)
++	set, rawValue, err := store.LoadSet(t.Context())
++	require.NoError(t, err)
++
++	past := time.Now().Add(-time.Minute)
++	for i := range set.Generations {
++		if !set.Generations[i].Active() {
++			set.Generations[i].RetainUntil = &past
++		}
++	}
++	set.Version++
++
++	swapped, err := store.CompareAndSwapSet(t.Context(), rawValue, set)
++	require.NoError(t, err)
++	require.True(t, swapped)
++}
++
++func signTokenForTest(t *testing.T, alg jwxjwa.KeyAlgorithm, key jwxjwk.Key, issuer string, expiry time.Time) string {
++	t.Helper()
++
++	token, err := jwxjwt.NewBuilder().
++		Issuer(issuer).
++		Subject("user-1").
++		IssuedAt(time.Now()).
++		Expiration(expiry).
++		Build()
++	require.NoError(t, err)
++	signed, err := jwxjwt.Sign(token, jwxjwt.WithKey(alg, key))
++	require.NoError(t, err)
++	return string(signed)
++}
++
++// captureJWKSAlg extracts the alg value for a given kid from a raw JWKS document
++func captureJWKSAlg(t *testing.T, raw []byte, kid string) string {
++	t.Helper()
++
++	set, err := jwxjwk.ParseString(string(raw))
++	require.NoError(t, err)
++	key, ok := set.LookupKeyID(kid)
++	require.True(t, ok, "kid %s must be present in the JWKS", kid)
++	alg, ok := key.Algorithm()
++	require.True(t, ok)
++	return `"` + alg.String() + `"`
++}
++
++func TestSigningKeyGenerationsJWKS(t *testing.T) {
++	db := testutils.NewDatabaseForTest(t)
++	envConfig := newTestEnvConfig()
++	instanceID, err := instanceid.Load(t.Context(), db)
++	require.NoError(t, err)
++	svc := initJwtService(t, db, instanceID, nil, envConfig)
++
++	firstKid, ok := svc.GetKeyID()
++	require.True(t, ok)
++	require.NotEmpty(t, firstKid)
++
++	// Rotate RS256 -> ES256 while the service keeps running
++	rotation := rotateAndReload(t, svc, "ES256", "", 48*time.Hour)
++	require.Equal(t, firstKid, rotation.RetiredKid)
++
++	// The JWKS must publish both public keys
++	jwksJSON, err := svc.GetPublicJWKSAsJSON()
++	require.NoError(t, err)
++	jwksString := string(jwksJSON)
++	assert.Contains(t, jwksString, firstKid, "JWKS must keep the retired kid within its compatibility window")
++	assert.Contains(t, jwksString, rotation.NewActiveKid, "JWKS must publish the new active kid")
++	assert.Equal(t, `"RS256"`, captureJWKSAlg(t, jwksJSON, firstKid))
++	assert.Equal(t, `"ES256"`, captureJWKSAlg(t, jwksJSON, rotation.NewActiveKid))
++
++	// The JWKS must never leak private key material or the symmetric session key
++	assert.NotContains(t, jwksString, `"d"`, "JWKS must not contain RSA private material")
++	assert.NotContains(t, jwksString, `"p"`, "JWKS must not contain RSA private primes")
++	assert.NotContains(t, jwksString, `"k"`, "JWKS must not contain symmetric private material")
++	sessionKid, _ := svc.sessionKey.KeyID()
++	assert.NotContains(t, jwksString, sessionKid, "JWKS must never contain the HS256 session key kid")
++	assert.NotContains(t, jwksString, jwxjwa.OctetSeq().String(), "JWKS must never contain symmetric keys")
++
++	// Discovery advertises every published algorithm, active first
++	algs, err := svc.GetKeyAlgorithms()
++	require.NoError(t, err)
++	assert.Equal(t, []string{"ES256", "RS256"}, algs)
++
++	// The active kid is the new one
++	activeKid, _ := svc.GetKeyID()
++	assert.Equal(t, rotation.NewActiveKid, activeKid)
++}
++
++func TestSigningKeyGenerationsVerifyOldTokensByKid(t *testing.T) {
++	for _, tc := range []struct {
++		name      string
++		alg       string
++		crv       string
++		nextAlg   string
++		nextCrv   string
++		retiredIs func(any) bool
++	}{
++		{name: "RS384", alg: "RS384", nextAlg: "ES256", retiredIs: func(k any) bool { _, ok := k.(*rsa.PublicKey); return ok }},
++		{name: "ES256", alg: "ES256", nextAlg: "RS256", retiredIs: func(k any) bool { _, ok := k.(*ecdsa.PublicKey); return ok }},
++		{name: "EdDSA", alg: "EdDSA", crv: "Ed25519", nextAlg: "ES256", retiredIs: func(k any) bool { _, ok := k.(ed25519.PublicKey); return ok }},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			db := testutils.NewDatabaseForTest(t)
++			envConfig := newTestEnvConfig()
++			instanceID, err := instanceid.Load(t.Context(), db)
++			require.NoError(t, err)
++			svc := initJwtService(t, db, instanceID, nil, envConfig)
++
++			// First rotation creates the generation under test, the second one retires it so it lands in the JWKS window
++			retiredRotation := rotateAndReload(t, svc, tc.alg, tc.crv, time.Hour)
++			loadedRetired, err := jwkutils.LoadSigningKeySet(t.Context(), db, envConfig, instanceID)
++			require.NoError(t, err)
++			retiredKey := loadedRetired.Keys[retiredRotation.NewActiveKid]
++			require.NotNil(t, retiredKey)
++			retiredAlg, _ := retiredKey.Algorithm()
++			rotateAndReload(t, svc, tc.nextAlg, tc.nextCrv, time.Hour)
++
++			// Sign a token with the retired key, as an application holding a pre-rotation token would have
++			tokenString := signTokenForTest(t, retiredAlg, retiredKey, envConfig.AppURL, time.Now().Add(time.Minute))
++
++			// The retired kid resolves to its raw public key for go-jose/fosite verification
++			rawPublic, ok := svc.GetVerificationKey(retiredRotation.NewActiveKid)
++			require.True(t, ok, "Retired kid must resolve to a verification key")
++			assert.True(t, tc.retiredIs(rawPublic), "Resolved key must be the retired algorithm's raw public key")
++
++			// Verification against the published key set works without picking the active key
++			keySet, err := svc.GetVerificationKeySet()
++			require.NoError(t, err)
++			parsed, err := jwxjwt.ParseString(tokenString,
++				jwxjwt.WithValidate(true),
++				jwxjwt.WithKeySet(keySet),
++				jwxjwt.WithIssuer(envConfig.AppURL),
++			)
++			require.NoError(t, err, "A token signed by the retired generation must verify through the JWKS key set")
++			subject, _ := parsed.Subject()
++			assert.Equal(t, "user-1", subject)
++
++			// An unknown kid does not resolve and must not fall back silently
++			_, ok = svc.GetVerificationKey("does-not-exist")
++			assert.False(t, ok)
++		})
++	}
++}
++
++func TestSigningKeyGenerationsReloadPicksUpRotation(t *testing.T) {
++	db := testutils.NewDatabaseForTest(t)
++	envConfig := newTestEnvConfig()
++	instanceID, err := instanceid.Load(t.Context(), db)
++	require.NoError(t, err)
++	svc := initJwtService(t, db, instanceID, nil, envConfig)
++
++	originalKid, _ := svc.GetKeyID()
++
++	// Simulate the key-rotate command in a separate process: no service method is involved
++	result, err := jwkutils.RotateSigningKeys(t.Context(), db, envConfig, instanceID, "ES256", "", time.Hour, time.Now())
++	require.NoError(t, err)
++
++	// Before reloading, the running signer still uses the old key, as the reload interval has not elapsed yet
++	kidBeforeReload, _ := svc.GetKeyID()
++	assert.Equal(t, originalKid, kidBeforeReload)
++
++	// A reload aligns the signer with the persistent active generation
++	require.NoError(t, svc.ReloadSigningKeys(t.Context()))
++	newKid, _ := svc.GetKeyID()
++	assert.Equal(t, result.NewActiveKid, newKid)
++	alg, err := svc.GetKeyAlg()
++	require.NoError(t, err)
++	assert.Equal(t, "ES256", alg.String())
++
++	// The retired key remains verifiable after reload
++	_, ok := svc.GetVerificationKey(originalKid)
++	assert.True(t, ok)
++}
++
++func TestSigningKeyGenerationsCleanup(t *testing.T) {
++	db := testutils.NewDatabaseForTest(t)
++	envConfig := newTestEnvConfig()
++	instanceID, err := instanceid.Load(t.Context(), db)
++	require.NoError(t, err)
++	svc := initJwtService(t, db, instanceID, nil, envConfig)
++
++	firstKid, _ := svc.GetKeyID()
++	rotateAndReload(t, svc, "ES256", "", time.Hour)
++
++	// Both keys are published before the deadline
++	_, ok := svc.GetVerificationKey(firstKid)
++	require.True(t, ok)
++
++	// Force the retired generation past its retain-until deadline, then run the cleanup job
++	expireRetiredGeneration(t, db, envConfig, instanceID)
++	count, err := svc.CleanupExpiredRetiredKeys(t.Context())
++	require.NoError(t, err)
++	assert.Equal(t, 1, count)
++
++	// The expired retired key is gone, while the active key keeps signing
++	_, ok = svc.GetVerificationKey(firstKid)
++	assert.False(t, ok, "Keys past their compatibility window must be removed from the JWKS")
++	activeKid, _ := svc.GetKeyID()
++	assert.NotEqual(t, firstKid, activeKid)
++
++	// Running the cleanup again is a safe, idempotent no-op
++	count, err = svc.CleanupExpiredRetiredKeys(t.Context())
++	require.NoError(t, err)
++	assert.Equal(t, 0, count)
++}
++
++func TestSigningKeyGenerationsReclaimStopsVerification(t *testing.T) {
++	db := testutils.NewDatabaseForTest(t)
++	envConfig := newTestEnvConfig()
++	instanceID, err := instanceid.Load(t.Context(), db)
++	require.NoError(t, err)
++	svc := initJwtService(t, db, instanceID, nil, envConfig)
++
++	loaded, err := jwkutils.LoadSigningKeySet(t.Context(), db, envConfig, instanceID)
++	require.NoError(t, err)
++	oldKey, _ := loaded.ActiveKey()
++	oldAlg, _ := oldKey.Algorithm()
++
++	rotateAndReload(t, svc, "ES256", "", time.Hour)
++
++	// While the window is open the old token verifies
++	tokenString := signTokenForTest(t, oldAlg, oldKey, envConfig.AppURL, time.Now().Add(time.Minute))
++	keySet, err := svc.GetVerificationKeySet()
++	require.NoError(t, err)
++	_, err = jwxjwt.ParseString(tokenString, jwxjwt.WithValidate(true), jwxjwt.WithKeySet(keySet))
++	require.NoError(t, err)
++
++	// After the cleanup removes the generation the same token can no longer verify
++	expireRetiredGeneration(t, db, envConfig, instanceID)
++	_, err = svc.CleanupExpiredRetiredKeys(t.Context())
++	require.NoError(t, err)
++	keySet, err = svc.GetVerificationKeySet()
++	require.NoError(t, err)
++	_, err = jwxjwt.ParseString(tokenString, jwxjwt.WithValidate(true), jwxjwt.WithKeySet(keySet))
++	require.Error(t, err, "Verification must fail once the retired key is reclaimed")
++}
+diff --git a/backend/internal/utils/jwk/signing_key_rotation.go b/backend/internal/utils/jwk/signing_key_rotation.go
+new file mode 100644
+index 00000000..5aed4027
+--- /dev/null
++++ b/backend/internal/utils/jwk/signing_key_rotation.go
+@@ -0,0 +1,444 @@
++package jwk
++
++// High-level operations on the persistent OIDC signing key set: first-run creation, legacy adoption, atomic rotation, pruning and KEK re-encryption
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"strings"
++	"time"
++
++	jwxjwk "github.com/lestrrat-go/jwx/v4/jwk"
++	"gorm.io/gorm"
++
++	"github.com/pocket-id/pocket-id/backend/internal/common"
++)
++
++// LoadedSigningKeySet is a signing key set together with the decrypted private key of every generation
++type LoadedSigningKeySet struct {
++	Set  *SigningKeySet
++	Keys map[string]jwxjwk.Key
++}
++
++// ActiveKey returns the decrypted private key of the active generation
++func (l *LoadedSigningKeySet) ActiveKey() (jwxjwk.Key, *SigningKeyGeneration) {
++	gen, _ := l.Set.Active()
++	if gen == nil {
++		return nil, nil
++	}
++	return l.Keys[gen.Kid], gen
++}
++
++// EnsureSigningKeySet loads the persistent set, creating it on first startup
++// It adopts the pre-generations single key row when present, otherwise generates the default RS256 key
++// A lost initialization race returns ErrRetryKeyStorage, exactly like the previous single-key flow
++func EnsureSigningKeySet(ctx context.Context, db *gorm.DB, envConfig *common.EnvConfigSchema, instanceID string, now time.Time) (*LoadedSigningKeySet, error) {
++	store, err := GetSigningKeySetStore(db, envConfig, instanceID)
++	if err != nil {
++		return nil, err
++	}
++
++	// Fast path: the set already exists, so just load and decrypt every generation
++	loaded, err := loadSetWithKeys(ctx, store)
++	if err == nil {
++		return loaded, nil
++	}
++	if !errors.Is(err, ErrSigningKeySetNotFound) {
++		return nil, err
++	}
++
++	// First run with the new schema: adopt the legacy single key so existing tokens keep their kid
++	legacyKey, err := store.LoadLegacyKey(ctx)
++	if err != nil {
++		return nil, fmt.Errorf("failed to load legacy signing key: %w", err)
++	}
++	if legacyKey != nil {
++		set, err := newSetFromKey(legacyKey, store, now)
++		if err != nil {
++			return nil, err
++		}
++		inserted, err := store.CreateSetAndDeleteLegacy(ctx, set)
++		if err != nil {
++			return nil, fmt.Errorf("failed to adopt legacy signing key: %w", err)
++		}
++		if !inserted {
++			// Another instance adopted or created the set first; reload its version
++			return nil, ErrRetryKeyStorage
++		}
++		return loadedSetFromSet(set, store)
++	}
++
++	// Brand-new deployment: generate the default RS256 key
++	key, err := GenerateKey("RS256", "")
++	if err != nil {
++		return nil, fmt.Errorf("failed to generate new signing key: %w", err)
++	}
++	set, err := newSetFromKey(key, store, now)
++	if err != nil {
++		return nil, err
++	}
++	inserted, err := store.CreateSet(ctx, set)
++	if err != nil {
++		return nil, fmt.Errorf("failed to store new signing key set: %w", err)
++	}
++	if !inserted {
++		// Another instance generated the first key concurrently; reload the winning one
++		return nil, ErrRetryKeyStorage
++	}
++	return loadedSetFromSet(set, store)
++}
++
++// RotationResult reports what a rotation did
++type RotationResult struct {
++	// NewActiveKid is the kid of the generation that now signs new tokens
++	NewActiveKid string
++	// RetiredKid is the kid that was retired by the rotation, or empty when a fresh set was bootstrapped
++	RetiredKid string
++}
++
++// RotateSigningKeys atomically makes a freshly generated key the active generation
++// The previous active generation becomes retired and stays verifiable until the retention window elapses
++// A concurrent change to the set makes the rotation fail with ErrSigningKeySetConflict instead of risking two active generations
++func RotateSigningKeys(ctx context.Context, db *gorm.DB, envConfig *common.EnvConfigSchema, instanceID, alg, crv string, retention time.Duration, now time.Time) (RotationResult, error) {
++	if retention <= 0 {
++		retention = DefaultRetiredSigningKeyRetention()
++	}
++
++	// Generate the new key before touching the database so generation failures leave no trace
++	newKey, err := GenerateKey(alg, crv)
++	if err != nil {
++		return RotationResult{}, fmt.Errorf("failed to generate new signing key: %w", err)
++	}
++
++	store, err := GetSigningKeySetStore(db, envConfig, instanceID)
++	if err != nil {
++		return RotationResult{}, err
++	}
++
++	var result RotationResult
++	for attempt := 0; ; attempt++ {
++		err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
++			txStore := store.WithDB(tx)
++			set, rawValue, err := txStore.LoadSet(ctx)
++			if errors.Is(err, ErrSigningKeySetNotFound) {
++				// Rotation on a never-initialized database bootstraps the set with the new key as its first active generation
++				result, err = bootstrapSetDuringRotation(ctx, txStore, newKey, now)
++				return err
++			}
++			if err != nil {
++				return err
++			}
++
++			active, _ := set.Active()
++			if active == nil {
++				return ErrSigningKeySetInvalid
++			}
++
++			// Drop generations whose compatibility window has already elapsed; this only removes keys no valid token can reference
++			kept := make([]SigningKeyGeneration, 0, len(set.Generations))
++			for _, gen := range set.Generations {
++				if gen.Expired(now) {
++					continue
++				}
++				kept = append(kept, gen)
++			}
++			set.Generations = kept
++
++			// Locate the active generation again, since pruning may have shifted its index
++			active, activeIdx := set.Active()
++			if active == nil {
++				return ErrSigningKeySetInvalid
++			}
++
++			// Retire the current active generation with the requested compatibility window
++			retiredAt := now.UTC()
++			retainUntil := now.Add(retention).UTC()
++			set.Generations[activeIdx].RetiredAt = &retiredAt
++			set.Generations[activeIdx].RetainUntil = &retainUntil
++
++			// Add the new generation as the single active one
++			generation, err := txStore.EncryptKey(newKey)
++			if err != nil {
++				return err
++			}
++			kid, _ := newKey.KeyID()
++			set.Generations = append(set.Generations, SigningKeyGeneration{
++				Kid:          kid,
++				Alg:          alg,
++				EncryptedJWK: generation,
++				CreatedAt:    now.UTC(),
++			})
++			set.ActiveKid = kid
++			set.Version++
++
++			swapped, err := txStore.CompareAndSwapSet(ctx, rawValue, set)
++			if err != nil {
++				return err
++			}
++			if !swapped {
++				// Refuse to overwrite a concurrent rotation; the operator can rerun the command
++				return ErrSigningKeySetConflict
++			}
++
++			result = RotationResult{NewActiveKid: kid, RetiredKid: active.Kid}
++			return nil
++		})
++		if err == nil {
++			return result, nil
++		}
++		if errors.Is(err, ErrSigningKeySetConflict) {
++			return RotationResult{}, err
++		}
++		// Transient SQLite write locks can occur when two rotation commands start at the exact same time
++		if attempt < 4 && isDatabaseLockedError(err) {
++			if err := sleepWithContext(ctx, 100*time.Millisecond); err != nil {
++				return RotationResult{}, err
++			}
++			continue
++		}
++		return RotationResult{}, fmt.Errorf("failed to rotate signing keys: %w", err)
++	}
++}
++
++// bootstrapSetDuringRotation creates the first set when no key exists yet
++// A legacy single key is adopted as the (immediately retired) first generation, so tokens it signed stay verifiable
++func bootstrapSetDuringRotation(ctx context.Context, store *SigningKeySetStore, newKey jwxjwk.Key, now time.Time) (RotationResult, error) {
++	legacyKey, err := store.LoadLegacyKey(ctx)
++	if err != nil {
++		return RotationResult{}, fmt.Errorf("failed to load legacy signing key: %w", err)
++	}
++
++	var generations []SigningKeyGeneration
++	result := RotationResult{}
++	if legacyKey != nil {
++		legacyGen, err := store.EncryptKey(legacyKey)
++		if err != nil {
++			return RotationResult{}, err
++		}
++		legacyKid, _ := legacyKey.KeyID()
++		legacyAlg, _ := legacyKey.Algorithm()
++		retiredAt := now.UTC()
++		generations = append(generations, SigningKeyGeneration{
++			Kid:          legacyKid,
++			Alg:          legacyAlg.String(),
++			EncryptedJWK: legacyGen,
++			CreatedAt:    now.UTC(),
++			RetiredAt:    &retiredAt,
++			RetainUntil:  &retiredAt,
++		})
++		result.RetiredKid = legacyKid
++	}
++
++	newEncrypted, err := store.EncryptKey(newKey)
++	if err != nil {
++		return RotationResult{}, err
++	}
++	newKid, _ := newKey.KeyID()
++	newAlg, _ := newKey.Algorithm()
++	generations = append(generations, SigningKeyGeneration{
++		Kid:          newKid,
++		Alg:          newAlg.String(),
++		EncryptedJWK: newEncrypted,
++		CreatedAt:    now.UTC(),
++	})
++	set := &SigningKeySet{
++		Version:     signingKeySetVersion,
++		ActiveKid:   newKid,
++		Generations: generations,
++	}
++
++	inserted, err := store.CreateSetAndDeleteLegacy(ctx, set)
++	if err != nil {
++		return RotationResult{}, err
++	}
++	if !inserted {
++		return RotationResult{}, ErrSigningKeySetConflict
++	}
++	result.NewActiveKid = newKid
++	return result, nil
++}
++
++// PruneRetiredSigningKeys deletes retired generations once their retain-until deadline has passed
++// The active generation is never removed, and a failed update leaves the set untouched so a later run can retry
++func PruneRetiredSigningKeys(ctx context.Context, db *gorm.DB, envConfig *common.EnvConfigSchema, instanceID string, now time.Time) (removedKids []string, err error) {
++	store, err := GetSigningKeySetStore(db, envConfig, instanceID)
++	if err != nil {
++		return nil, err
++	}
++
++	for attempt := 0; ; attempt++ {
++		removedKids = nil
++		err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
++			txStore := store.WithDB(tx)
++			set, rawValue, err := txStore.LoadSet(ctx)
++			if errors.Is(err, ErrSigningKeySetNotFound) {
++				// Nothing to prune before the set exists
++				return nil
++			}
++			if err != nil {
++				return err
++			}
++
++			kept := make([]SigningKeyGeneration, 0, len(set.Generations))
++			for _, gen := range set.Generations {
++				if gen.Expired(now) {
++					removedKids = append(removedKids, gen.Kid)
++					continue
++				}
++				kept = append(kept, gen)
++			}
++			if len(removedKids) == 0 {
++				return nil
++			}
++			set.Generations = kept
++			set.Version++
++
++			swapped, err := txStore.CompareAndSwapSet(ctx, rawValue, set)
++			if err != nil {
++				return err
++			}
++			if !swapped {
++				// A rotation or another pruner changed the set; retry from the fresh row
++				return ErrSigningKeySetConflict
++			}
++			return nil
++		})
++		if err == nil {
++			return removedKids, nil
++		}
++		if errors.Is(err, ErrSigningKeySetNotFound) {
++			return nil, nil
++		}
++		if errors.Is(err, ErrSigningKeySetConflict) {
++			// A conflict here means the read set was stale; reloading and retrying cannot remove a wrong generation
++			if attempt < 4 {
++				if err := sleepWithContext(ctx, 100*time.Millisecond); err != nil {
++					return nil, err
++				}
++				continue
++			}
++			return nil, err
++		}
++		if attempt < 4 && isDatabaseLockedError(err) {
++			if err := sleepWithContext(ctx, 100*time.Millisecond); err != nil {
++				return nil, err
++			}
++			continue
++		}
++		return nil, fmt.Errorf("failed to prune retired signing keys: %w", err)
++	}
++}
++
++// ReEncryptSigningKeySet re-wraps every generation's private JWK with a new KEK, preserving active generation and deadlines
++// A missing set is not an error, since the encryption-key-rotate command also runs on deployments still using the legacy row
++func ReEncryptSigningKeySet(ctx context.Context, db *gorm.DB, oldKek, newKek []byte) error {
++	if len(oldKek) == 0 || len(newKek) == 0 {
++		return errors.New("both the old and new encryption keys are required to re-encrypt the signing key set")
++	}
++
++	oldStore := &SigningKeySetStore{db: db, kek: oldKek}
++	set, rawValue, err := oldStore.LoadSet(ctx)
++	if errors.Is(err, ErrSigningKeySetNotFound) {
++		return nil
++	}
++	if err != nil {
++		return fmt.Errorf("failed to load signing key set with old encryption key: %w", err)
++	}
++
++	newStore := &SigningKeySetStore{db: db, kek: newKek}
++	for i := range set.Generations {
++		key, err := oldStore.DecryptKey(set.Generations[i])
++		if err != nil {
++			return fmt.Errorf("failed to decrypt generation %q: %w", set.Generations[i].Kid, err)
++		}
++		encrypted, err := newStore.EncryptKey(key)
++		if err != nil {
++			return fmt.Errorf("failed to re-encrypt generation %q: %w", set.Generations[i].Kid, err)
++		}
++		set.Generations[i].EncryptedJWK = encrypted
++	}
++	set.Version++
++
++	swapped, err := newStore.CompareAndSwapSet(ctx, rawValue, set)
++	if err != nil {
++		return err
++	}
++	if !swapped {
++		return errors.New("the signing key set changed while re-encrypting it, please retry the encryption-key-rotate command")
++	}
++	return nil
++}
++
++// LoadSigningKeySet reads the set and decrypts every generation, used by running instances that refresh their signer
++func LoadSigningKeySet(ctx context.Context, db *gorm.DB, envConfig *common.EnvConfigSchema, instanceID string) (*LoadedSigningKeySet, error) {
++	store, err := GetSigningKeySetStore(db, envConfig, instanceID)
++	if err != nil {
++		return nil, err
++	}
++	return loadSetWithKeys(ctx, store)
++}
++
++// newSetFromKey builds the first document around an existing or freshly generated private key
++func newSetFromKey(key jwxjwk.Key, store *SigningKeySetStore, now time.Time) (*SigningKeySet, error) {
++	encrypted, err := store.EncryptKey(key)
++	if err != nil {
++		return nil, err
++	}
++	kid, _ := key.KeyID()
++	alg, _ := key.Algorithm()
++	return &SigningKeySet{
++		Version: signingKeySetVersion,
++		ActiveKid: kid,
++		Generations: []SigningKeyGeneration{{
++			Kid:          kid,
++			Alg:          alg.String(),
++			EncryptedJWK: encrypted,
++			CreatedAt:    now.UTC(),
++		}},
++	}, nil
++}
++
++func loadSetWithKeys(ctx context.Context, store *SigningKeySetStore) (*LoadedSigningKeySet, error) {
++	set, _, err := store.LoadSet(ctx)
++	if err != nil {
++		return nil, err
++	}
++	return loadedSetFromSet(set, store)
++}
++
++func loadedSetFromSet(set *SigningKeySet, store *SigningKeySetStore) (*LoadedSigningKeySet, error) {
++	keys := make(map[string]jwxjwk.Key, len(set.Generations))
++	for _, gen := range set.Generations {
++		key, err := store.DecryptKey(gen)
++		if err != nil {
++			return nil, fmt.Errorf("failed to decrypt signing key generation %q: %w", gen.Kid, err)
++		}
++		keys[gen.Kid] = key
++	}
++	if _, ok := keys[set.ActiveKid]; !ok {
++		return nil, fmt.Errorf("%w: private key for active kid %q is missing", ErrSigningKeySetInvalid, set.ActiveKid)
++	}
++	return &LoadedSigningKeySet{Set: set, Keys: keys}, nil
++}
++
++// isDatabaseLockedError recognizes SQLite's busy/locked errors, which are safe to retry
++func isDatabaseLockedError(err error) bool {
++	if err == nil {
++		return false
++	}
++	message := strings.ToLower(err.Error())
++	return strings.Contains(message, "database is locked") || strings.Contains(message, "database table is locked") || strings.Contains(message, "database is busy")
++}
++
++// sleepWithContext waits for the delay unless the context is canceled
++func sleepWithContext(ctx context.Context, delay time.Duration) error {
++	timer := time.NewTimer(delay)
++	defer timer.Stop()
++	select {
++	case <-ctx.Done():
++		return ctx.Err()
++	case <-timer.C:
++		return nil
++	}
++}
+diff --git a/backend/internal/utils/jwk/signing_key_set.go b/backend/internal/utils/jwk/signing_key_set.go
+new file mode 100644
+index 00000000..371b0c3a
+--- /dev/null
++++ b/backend/internal/utils/jwk/signing_key_set.go
+@@ -0,0 +1,348 @@
++package jwk
++
++// The OIDC token signing keys live as a persistent set of "generations" in a single "kv" row
++// One generation is active and signs new tokens; retired generations stay verifiable until their retain-until deadline passes
++// A single-row document makes switching the active generation an atomic compare-and-swap on both SQLite and Postgres
++
++import (
++	"context"
++	"encoding/base64"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"time"
++
++	jwxjwk "github.com/lestrrat-go/jwx/v4/jwk"
++	"gorm.io/gorm"
++	"gorm.io/gorm/clause"
++
++	"github.com/pocket-id/pocket-id/backend/internal/common"
++	"github.com/pocket-id/pocket-id/backend/internal/model"
++	cryptoutils "github.com/pocket-id/pocket-id/backend/internal/utils/crypto"
++)
++
++const (
++	// SigningKeysDBKey is the kv row containing the persistent set of OIDC token signing keys
++	SigningKeysDBKey = "oidc_signing_keys.json"
++
++	// signingKeySetVersion is the schema version of the persisted document
++	signingKeySetVersion = 1
++)
++
++var (
++	// ErrSigningKeySetNotFound signals that the persistent signing key set has not been created yet
++	ErrSigningKeySetNotFound = errors.New("signing key set not found")
++	// ErrSigningKeySetConflict signals that the signing key set changed between read and write, so another writer won the race
++	ErrSigningKeySetConflict = errors.New("the signing key set was modified by another process, please retry")
++	// ErrSigningKeySetInvalid signals that the persisted signing key set does not contain exactly one active generation
++	ErrSigningKeySetInvalid = errors.New("persisted signing key set is invalid")
++)
++
++// DefaultRetiredSigningKeyRetention is how long a retired signing key remains published for verification after rotation
++// It covers the longest configurable OIDC token lifetime, so every token issued before rotation stays verifiable until it expires
++func DefaultRetiredSigningKeyRetention() time.Duration {
++	return time.Duration(model.MaxTokenDurationMinutes) * time.Minute
++}
++
++// SigningKeyGeneration is one generation of the OIDC signing key, with its private JWK encrypted at rest
++type SigningKeyGeneration struct {
++	// Kid identifies the key in JWS headers and the JWKS
++	Kid string
++	// Alg is the JWA signature algorithm the key was generated for
++	Alg string
++	// EncryptedJWK is the base64-encoded KEK ciphertext of the private JWK
++	EncryptedJWK string
++	// CreatedAt is when the generation was created
++	CreatedAt time.Time
++	// RetiredAt is when the generation stopped being the active one, or nil while it is active
++	RetiredAt *time.Time
++	// RetainUntil is when a retired generation may stop being published in the JWKS and be deleted
++	RetainUntil *time.Time
++}
++
++// Active reports whether the generation is the current signing generation
++func (g SigningKeyGeneration) Active() bool {
++	return g.RetiredAt == nil
++}
++
++// Expired reports whether a retired generation has passed its retain-until deadline
++func (g SigningKeyGeneration) Expired(now time.Time) bool {
++	return !g.Active() && g.RetainUntil != nil && !g.RetainUntil.After(now)
++}
++
++// SigningKeySet is the persistent document: one active generation and zero or more retired generations
++type SigningKeySet struct {
++	Version     int
++	ActiveKid   string
++	Generations []SigningKeyGeneration
++}
++
++// Active returns the active generation and its index
++func (s *SigningKeySet) Active() (*SigningKeyGeneration, int) {
++	for i := range s.Generations {
++		if s.Generations[i].Kid == s.ActiveKid {
++			return &s.Generations[i], i
++		}
++	}
++	return nil, -1
++}
++
++// Validate enforces the invariant the rest of the code relies on: exactly one active generation, and it must match ActiveKid
++func (s *SigningKeySet) Validate() error {
++	if s == nil || s.Version == 0 {
++		return fmt.Errorf("%w: missing version", ErrSigningKeySetInvalid)
++	}
++	if s.ActiveKid == "" {
++		return fmt.Errorf("%w: no active key id", ErrSigningKeySetInvalid)
++	}
++
++	activeCount := 0
++	kids := make(map[string]struct{}, len(s.Generations))
++	for i := range s.Generations {
++		gen := &s.Generations[i]
++		if gen.Kid == "" || gen.EncryptedJWK == "" {
++			return fmt.Errorf("%w: generation %d is missing key material", ErrSigningKeySetInvalid, i)
++		}
++		if _, exists := kids[gen.Kid]; exists {
++			return fmt.Errorf("%w: duplicate key id %q", ErrSigningKeySetInvalid, gen.Kid)
++		}
++		kids[gen.Kid] = struct{}{}
++		if gen.Active() {
++			activeCount++
++		}
++	}
++
++	if activeCount != 1 {
++		return fmt.Errorf("%w: expected exactly one active generation, found %d", ErrSigningKeySetInvalid, activeCount)
++	}
++	if _, ok := kids[s.ActiveKid]; !ok {
++		return fmt.Errorf("%w: active key id %q is not among the stored generations", ErrSigningKeySetInvalid, s.ActiveKid)
++	}
++	return nil
++}
++
++// Persisted DTOs keep the on-disk format explicit and independent of the domain types
++type signingKeyGenerationDTO struct {
++	Kid          string     `json:"kid"`
++	Alg          string     `json:"alg"`
++	EncryptedJWK string     `json:"encrypted_jwk"`
++	CreatedAt    time.Time  `json:"created_at"`
++	RetiredAt    *time.Time `json:"retired_at,omitempty"`
++	RetainUntil  *time.Time `json:"retain_until,omitempty"`
++}
++
++type signingKeySetDTO struct {
++	Version     int                       `json:"version"`
++	ActiveKid   string                    `json:"active_kid"`
++	Generations []signingKeyGenerationDTO `json:"generations"`
++}
++
++func (s *SigningKeySet) toDTO() *signingKeySetDTO {
++	dto := &signingKeySetDTO{
++		Version:     s.Version,
++		ActiveKid:   s.ActiveKid,
++		Generations: make([]signingKeyGenerationDTO, len(s.Generations)),
++	}
++	for i, gen := range s.Generations {
++		dto.Generations[i] = signingKeyGenerationDTO(gen)
++	}
++	return dto
++}
++
++func (d *signingKeySetDTO) toSet() *SigningKeySet {
++	set := &SigningKeySet{
++		Version:     d.Version,
++		ActiveKid:   d.ActiveKid,
++		Generations: make([]SigningKeyGeneration, len(d.Generations)),
++	}
++	for i, gen := range d.Generations {
++		set.Generations[i] = SigningKeyGeneration(gen)
++	}
++	return set
++}
++
++// SigningKeySetStore reads and writes the persistent signing key set, encrypting every private JWK with the KEK
++type SigningKeySetStore struct {
++	db  *gorm.DB
++	kek []byte
++}
++
++// GetSigningKeySetStore returns the store for the persistent OIDC token signing key set
++func GetSigningKeySetStore(db *gorm.DB, envConfig *common.EnvConfigSchema, instanceID string) (*SigningKeySetStore, error) {
++	kek, err := LoadKeyEncryptionKey(envConfig, instanceID)
++	if err != nil {
++		return nil, fmt.Errorf("failed to load encryption key: %w", err)
++	}
++	if len(kek) == 0 {
++		return nil, errors.New("an encryption key is required for the signing key set")
++	}
++	return &SigningKeySetStore{db: db, kek: kek}, nil
++}
++
++// WithDB returns a store using the given transaction, keeping the same KEK
++func (s *SigningKeySetStore) WithDB(db *gorm.DB) *SigningKeySetStore {
++	return &SigningKeySetStore{db: db, kek: s.kek}
++}
++
++// LoadSet reads and parses the persistent set, returning the exact raw row value needed for a compare-and-swap
++// A missing row returns ErrSigningKeySetNotFound so callers can distinguish "not initialized yet" from database errors
++func (s *SigningKeySetStore) LoadSet(ctx context.Context) (set *SigningKeySet, rawValue string, err error) {
++	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
++	defer cancel()
++
++	row := model.KV{Key: SigningKeysDBKey}
++	err = s.db.WithContext(ctx).First(&row).Error
++	if errors.Is(err, gorm.ErrRecordNotFound) {
++		return nil, "", ErrSigningKeySetNotFound
++	} else if err != nil {
++		return nil, "", fmt.Errorf("failed to retrieve signing key set from the database: %w", err)
++	}
++	if row.Value == nil || *row.Value == "" {
++		return nil, "", ErrSigningKeySetNotFound
++	}
++
++	set, err = decodeSigningKeySet([]byte(*row.Value))
++	if err != nil {
++		return nil, "", err
++	}
++	return set, *row.Value, nil
++}
++
++// CreateSet inserts the set only if no row exists yet, which serializes first-time initialization across instances
++func (s *SigningKeySetStore) CreateSet(ctx context.Context, set *SigningKeySet) (inserted bool, err error) {
++	value, err := s.encodeSet(set)
++	if err != nil {
++		return false, err
++	}
++
++	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
++	defer cancel()
++	result := s.db.
++		WithContext(ctx).
++		Clauses(clause.OnConflict{
++			Columns:   []clause.Column{{Name: "key"}},
++			DoNothing: true,
++		}).
++		Create(&model.KV{Key: SigningKeysDBKey, Value: &value})
++	if result.Error != nil {
++		return false, fmt.Errorf("failed to store signing key set: %w", result.Error)
++	}
++	return result.RowsAffected == 1, nil
++}
++
++// CreateSetAndDeleteLegacy inserts the set and, only for the winning inserter, removes the superseded single-key row
++// Both statements run in one transaction so a crash can never leave the adoption half-applied
++func (s *SigningKeySetStore) CreateSetAndDeleteLegacy(ctx context.Context, set *SigningKeySet) (inserted bool, err error) {
++	value, err := s.encodeSet(set)
++	if err != nil {
++		return false, err
++	}
++
++	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
++	defer cancel()
++	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
++		result := tx.
++			Clauses(clause.OnConflict{
++				Columns:   []clause.Column{{Name: "key"}},
++				DoNothing: true,
++			}).
++			Create(&model.KV{Key: SigningKeysDBKey, Value: &value})
++		if result.Error != nil {
++			return fmt.Errorf("failed to store signing key set: %w", result.Error)
++		}
++		inserted = result.RowsAffected == 1
++
++		// Only the writer that actually created the row may remove the legacy key, so a losing adopter can't delete it
++		if inserted {
++			if err := tx.Delete(&model.KV{}, "key = ?", PrivateKeyDBKey).Error; err != nil {
++				return fmt.Errorf("failed to remove legacy signing key row: %w", err)
++			}
++		}
++		return nil
++	})
++	if err != nil {
++		return false, err
++	}
++	return inserted, nil
++}
++
++// CompareAndSwapSet replaces the row value only if it still equals the raw value that was read
++// A zero affected count means another process changed the set first
++func (s *SigningKeySetStore) CompareAndSwapSet(ctx context.Context, previousRawValue string, set *SigningKeySet) (swapped bool, err error) {
++	value, err := s.encodeSet(set)
++	if err != nil {
++		return false, err
++	}
++
++	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
++	defer cancel()
++	result := s.db.
++		WithContext(ctx).
++		Model(&model.KV{}).
++		Where("key = ? AND value = ?", SigningKeysDBKey, previousRawValue).
++		Update("value", value)
++	if result.Error != nil {
++		return false, fmt.Errorf("failed to update signing key set: %w", result.Error)
++	}
++	return result.RowsAffected == 1, nil
++}
++
++// LoadLegacyKey loads the single-key row used before signing key generations existed
++// It returns nil when the row is absent
++func (s *SigningKeySetStore) LoadLegacyKey(ctx context.Context) (jwxjwk.Key, error) {
++	provider := &KeyProviderDatabase{db: s.db, kek: s.kek, dbKey: PrivateKeyDBKey}
++	return provider.LoadKey(ctx)
++}
++
++// EncryptKey stores a private JWK as a base64-encoded KEK ciphertext
++func (s *SigningKeySetStore) EncryptKey(key jwxjwk.Key) (string, error) {
++	data, err := EncodeJWKBytes(key)
++	if err != nil {
++		return "", fmt.Errorf("failed to encode key to JSON: %w", err)
++	}
++	enc, err := cryptoutils.Encrypt(s.kek, data, nil)
++	if err != nil {
++		return "", fmt.Errorf("failed to encrypt key: %w", err)
++	}
++	return base64.StdEncoding.EncodeToString(enc), nil
++}
++
++// DecryptKey parses a generation's private JWK back into a jwk.Key
++func (s *SigningKeySetStore) DecryptKey(generation SigningKeyGeneration) (jwxjwk.Key, error) {
++	enc, err := base64.StdEncoding.DecodeString(generation.EncryptedJWK)
++	if err != nil {
++		return nil, fmt.Errorf("failed to read encrypted key for kid %q: not a valid base64 value: %w", generation.Kid, err)
++	}
++	data, err := cryptoutils.Decrypt(s.kek, enc, nil)
++	if err != nil {
++		return nil, fmt.Errorf("failed to decrypt key for kid %q: %w", generation.Kid, err)
++	}
++	key, err := jwxjwk.ParseKey(data)
++	if err != nil {
++		return nil, fmt.Errorf("failed to parse encrypted key for kid %q: %w", generation.Kid, err)
++	}
++	return key, nil
++}
++
++func (s *SigningKeySetStore) encodeSet(set *SigningKeySet) (string, error) {
++	if err := set.Validate(); err != nil {
++		return "", err
++	}
++	data, err := json.Marshal(set.toDTO())
++	if err != nil {
++		return "", fmt.Errorf("failed to encode signing key set: %w", err)
++	}
++	return string(data), nil
++}
++
++func decodeSigningKeySet(data []byte) (*SigningKeySet, error) {
++	var dto signingKeySetDTO
++	if err := json.Unmarshal(data, &dto); err != nil {
++		return nil, fmt.Errorf("failed to parse signing key set: %w", err)
++	}
++	set := dto.toSet()
++	if err := set.Validate(); err != nil {
++		return nil, err
++	}
++	return set, nil
++}
+diff --git a/backend/internal/utils/jwk/signing_key_set_test.go b/backend/internal/utils/jwk/signing_key_set_test.go
+new file mode 100644
+index 00000000..bbbdad23
+--- /dev/null
++++ b/backend/internal/utils/jwk/signing_key_set_test.go
+@@ -0,0 +1,420 @@
++package jwk
++
++import (
++	"testing"
++	"time"
++
++	jwxjwk "github.com/lestrrat-go/jwx/v4/jwk"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"gorm.io/gorm"
++
++	"github.com/pocket-id/pocket-id/backend/internal/common"
++	"github.com/pocket-id/pocket-id/backend/internal/instanceid"
++	"github.com/pocket-id/pocket-id/backend/internal/model"
++	testutils "github.com/pocket-id/pocket-id/backend/internal/utils/testing"
++)
++
++func newSetTestEnv(t *testing.T) (*gorm.DB, *common.EnvConfigSchema, string) {
++	t.Helper()
++
++	envConfig := &common.EnvConfigSchema{EncryptionKey: []byte("test-encryption-key-characters-long")}
++	db := testutils.NewDatabaseForTest(t)
++	instanceID, err := instanceid.Load(t.Context(), db)
++	require.NoError(t, err)
++	return db, envConfig, instanceID
++}
++
++func TestEnsureSigningKeySetGeneratesDefaultKey(t *testing.T) {
++	db, envConfig, instanceID := newSetTestEnv(t)
++
++	loaded, err := EnsureSigningKeySet(t.Context(), db, envConfig, instanceID, time.Now())
++	require.NoError(t, err)
++	require.Len(t, loaded.Set.Generations, 1)
++
++	key, gen := loaded.ActiveKey()
++	require.NotNil(t, key)
++	require.NotNil(t, gen)
++	assert.True(t, gen.Active(), "The first generation must be active")
++	assert.Nil(t, gen.RetainUntil)
++
++	alg, _ := key.Algorithm()
++	assert.Equal(t, "RS256", alg.String(), "The default key must be RS256")
++
++	// A second startup must load the same key instead of generating another
++	again, err := EnsureSigningKeySet(t.Context(), db, envConfig, instanceID, time.Now())
++	require.NoError(t, err)
++	againKey, _ := again.ActiveKey()
++	firstKid, _ := key.KeyID()
++	againKid, _ := againKey.KeyID()
++	assert.Equal(t, firstKid, againKid)
++}
++
++func TestEnsureSigningKeySetAdoptsLegacyKey(t *testing.T) {
++	db, envConfig, instanceID := newSetTestEnv(t)
++
++	// Simulate a pre-upgrade deployment with only the legacy single-key row
++	legacyKey, err := GenerateKey("ES256", "")
++	require.NoError(t, err)
++	legacyProvider, err := GetKeyProvider(db, envConfig, instanceID)
++	require.NoError(t, err)
++	require.NoError(t, legacyProvider.SaveKey(t.Context(), legacyKey))
++	legacyKid, _ := legacyKey.KeyID()
++
++	loaded, err := EnsureSigningKeySet(t.Context(), db, envConfig, instanceID, time.Now())
++	require.NoError(t, err)
++	key, gen := loaded.ActiveKey()
++	require.NotNil(t, key)
++	require.NotNil(t, gen)
++	assert.Equal(t, legacyKid, gen.Kid, "The legacy key must be adopted as the active generation with the same kid")
++
++	// Adoption removes the legacy row in the same transaction
++	stillThere, err := legacyProvider.LoadKey(t.Context())
++	require.NoError(t, err)
++	assert.Nil(t, stillThere, "The legacy single-key row must be removed after adoption")
++
++	// Restarting keeps the adopted generation
++	again, err := EnsureSigningKeySet(t.Context(), db, envConfig, instanceID, time.Now())
++	require.NoError(t, err)
++	againKey, _ := again.ActiveKey()
++	againKid, _ := againKey.KeyID()
++	assert.Equal(t, legacyKid, againKid)
++}
++
++func TestEnsureSigningKeySetAnotherWritersSetWins(t *testing.T) {
++	db, envConfig, instanceID := newSetTestEnv(t)
++
++	// Another replica initializes first and owns the set row
++	first, err := EnsureSigningKeySet(t.Context(), db, envConfig, instanceID, time.Now())
++	require.NoError(t, err)
++	firstGen, _ := first.Set.Active()
++
++	// A late writer attempting a first-run insert must be told to reload instead of overwriting
++	store, err := GetSigningKeySetStore(db, envConfig, instanceID)
++	require.NoError(t, err)
++	competingKey, err := GenerateKey("RS256", "")
++	require.NoError(t, err)
++	competingSet, err := newSetFromKey(competingKey, store, time.Now())
++	require.NoError(t, err)
++	inserted, err := store.CreateSet(t.Context(), competingSet)
++	require.NoError(t, err)
++	assert.False(t, inserted, "Inserting a second initial set must not overwrite the existing one")
++
++	loaded, err := LoadSigningKeySet(t.Context(), db, envConfig, instanceID)
++	require.NoError(t, err)
++	_, activeGen := loaded.ActiveKey()
++	assert.Equal(t, firstGen.Kid, activeGen.Kid, "The winning replica's key must stay active")
++}
++
++func TestRotateSigningKeysSwitchesActiveGenerationAtomically(t *testing.T) {
++	db, envConfig, instanceID := newSetTestEnv(t)
++
++	_, err := EnsureSigningKeySet(t.Context(), db, envConfig, instanceID, time.Now())
++	require.NoError(t, err)
++	before, err := LoadSigningKeySet(t.Context(), db, envConfig, instanceID)
++	require.NoError(t, err)
++	_, oldGen := before.ActiveKey()
++
++	const retention = 24 * time.Hour
++	now := time.Now()
++	result, err := RotateSigningKeys(t.Context(), db, envConfig, instanceID, "ES256", "", retention, now)
++	require.NoError(t, err)
++	assert.NotEmpty(t, result.NewActiveKid)
++	assert.Equal(t, oldGen.Kid, result.RetiredKid)
++	assert.NotEqual(t, result.NewActiveKid, result.RetiredKid)
++
++	after, err := LoadSigningKeySet(t.Context(), db, envConfig, instanceID)
++	require.NoError(t, err)
++	require.Len(t, after.Set.Generations, 2)
++
++	_, activeGen := after.ActiveKey()
++	assert.Equal(t, result.NewActiveKid, activeGen.Kid)
++	assert.Equal(t, "ES256", activeGen.Alg)
++	assert.True(t, activeGen.Active())
++
++	var retired *SigningKeyGeneration
++	for i := range after.Set.Generations {
++		if after.Set.Generations[i].Kid == oldGen.Kid {
++			retired = &after.Set.Generations[i]
++		}
++	}
++	require.NotNil(t, retired)
++	require.NotNil(t, retired.RetiredAt)
++	require.NotNil(t, retired.RetainUntil)
++	assert.WithinDuration(t, now.Add(retention), *retired.RetainUntil, time.Second)
++
++	// The old private key must still decrypt, since tokens signed with it are still valid
++	oldKey := after.Keys[oldGen.Kid]
++	require.NotNil(t, oldKey)
++
++	// Exactly one active generation is an invariant of the persisted document
++	activeCount := 0
++	for _, gen := range after.Set.Generations {
++		if gen.Active() {
++			activeCount++
++		}
++	}
++	assert.Equal(t, 1, activeCount)
++}
++
++func TestRotateSigningKeysBootstrapsWithoutKey(t *testing.T) {
++	db, envConfig, instanceID := newSetTestEnv(t)
++
++	// Rotation on a pristine deployment creates the requested key as the first active generation
++	result, err := RotateSigningKeys(t.Context(), db, envConfig, instanceID, "ES384", "", 0, time.Now())
++	require.NoError(t, err)
++	assert.NotEmpty(t, result.NewActiveKid)
++	assert.Empty(t, result.RetiredKid, "There is no previous generation to retire")
++
++	loaded, err := LoadSigningKeySet(t.Context(), db, envConfig, instanceID)
++	require.NoError(t, err)
++	require.Len(t, loaded.Set.Generations, 1)
++	_, gen := loaded.ActiveKey()
++	assert.Equal(t, "ES384", gen.Alg)
++	assert.True(t, gen.Active())
++}
++
++func TestRotateSigningKeysAdoptsAndRetiresLegacyKey(t *testing.T) {
++	db, envConfig, instanceID := newSetTestEnv(t)
++
++	legacyKey, err := GenerateKey("RS256", "")
++	require.NoError(t, err)
++	legacyProvider, err := GetKeyProvider(db, envConfig, instanceID)
++	require.NoError(t, err)
++	require.NoError(t, legacyProvider.SaveKey(t.Context(), legacyKey))
++	legacyKid, _ := legacyKey.KeyID()
++
++	result, err := RotateSigningKeys(t.Context(), db, envConfig, instanceID, "ES256", "", time.Hour, time.Now())
++	require.NoError(t, err)
++	assert.Equal(t, legacyKid, result.RetiredKid)
++	assert.NotEqual(t, legacyKid, result.NewActiveKid)
++
++	loaded, err := LoadSigningKeySet(t.Context(), db, envConfig, instanceID)
++	require.NoError(t, err)
++	require.Len(t, loaded.Set.Generations, 2, "The legacy key must be kept as a retired generation")
++	require.NotNil(t, loaded.Keys[legacyKid], "The retired legacy key must still be decryptable")
++}
++
++func TestCompareAndSwapRejectsStaleReads(t *testing.T) {
++	db, envConfig, instanceID := newSetTestEnv(t)
++
++	store, err := GetSigningKeySetStore(db, envConfig, instanceID)
++	require.NoError(t, err)
++
++	first, err := EnsureSigningKeySet(t.Context(), db, envConfig, instanceID, time.Now())
++	require.NoError(t, err)
++	_, staleRaw, err := store.LoadSet(t.Context())
++	require.NoError(t, err)
++
++	// A committed rotation changes the row, so a write based on the previous value must fail
++	_, err = RotateSigningKeys(t.Context(), db, envConfig, instanceID, "ES256", "", time.Hour, time.Now())
++	require.NoError(t, err)
++
++	// Attempt to commit the stale document back: nothing must be overwritten
++	stale := first.Set
++	swapped, err := store.CompareAndSwapSet(t.Context(), staleRaw, stale)
++	require.NoError(t, err)
++	assert.False(t, swapped, "A stale compare-and-swap must not replace the current set")
++
++	current, err := LoadSigningKeySet(t.Context(), db, envConfig, instanceID)
++	require.NoError(t, err)
++	_, currentActive := current.ActiveKey()
++	assert.Equal(t, "ES256", currentActive.Alg, "The committed rotation must survive the stale write")
++}
++
++func TestRotateSigningKeysDropsAlreadyExpiredGenerations(t *testing.T) {
++	db, envConfig, instanceID := newSetTestEnv(t)
++	store, err := GetSigningKeySetStore(db, envConfig, instanceID)
++	require.NoError(t, err)
++
++	// Seed three generations: one active, one still in its compatibility window, one expired
++	seeded := buildSeedSet(t, store, []seedGenerationSpec{
++		{alg: "RS256", retired: true, expired: true},
++		{alg: "RS384", retired: true, expired: false},
++		{alg: "ES256", active: true},
++	})
++	inserted, err := store.CreateSet(t.Context(), seeded)
++	require.NoError(t, err)
++	require.True(t, inserted)
++
++	// Rotation must remove the expired generation but keep the one still within the window
++	result, err := RotateSigningKeys(t.Context(), db, envConfig, instanceID, "EdDSA", "Ed25519", time.Hour, time.Now())
++	require.NoError(t, err)
++
++	loaded, err := LoadSigningKeySet(t.Context(), db, envConfig, instanceID)
++	require.NoError(t, err)
++	assert.Len(t, loaded.Set.Generations, 3, "Expired generation removed; active and unexpired retained; new generation appended")
++	assert.Equal(t, result.NewActiveKid, loaded.Set.ActiveKid)
++	for _, gen := range loaded.Set.Generations {
++		assert.NotEqual(t, "RS256", gen.Alg, "The expired RS256 generation must have been pruned")
++	}
++}
++
++func TestPruneRetiredSigningKeys(t *testing.T) {
++	db, envConfig, instanceID := newSetTestEnv(t)
++	store, err := GetSigningKeySetStore(db, envConfig, instanceID)
++	require.NoError(t, err)
++
++	seeded := buildSeedSet(t, store, []seedGenerationSpec{
++		{kid: "expired", alg: "RS256", retired: true, expired: true},
++		{kid: "valid", alg: "RS384", retired: true, expired: false},
++		{kid: "active", alg: "ES256", active: true},
++	})
++	inserted, err := store.CreateSet(t.Context(), seeded)
++	require.NoError(t, err)
++	require.True(t, inserted)
++
++	now := time.Now()
++	removed, err := PruneRetiredSigningKeys(t.Context(), db, envConfig, instanceID, now)
++	require.NoError(t, err)
++	assert.Equal(t, []string{"expired"}, removed, "Only the generation past its retain-until deadline is removed")
++
++	loaded, err := LoadSigningKeySet(t.Context(), db, envConfig, instanceID)
++	require.NoError(t, err)
++	assert.Len(t, loaded.Set.Generations, 2)
++	_, activeGen := loaded.ActiveKey()
++	assert.Equal(t, "active", activeGen.Kid, "The active generation can never be pruned")
++
++	var kids []string
++	for _, gen := range loaded.Set.Generations {
++		kids = append(kids, gen.Kid)
++	}
++	assert.Contains(t, kids, "valid")
++	assert.NotContains(t, kids, "expired")
++
++	// A second run after the deadline is a safe no-op, so cleanup restarts and failures can retry
++	removed, err = PruneRetiredSigningKeys(t.Context(), db, envConfig, instanceID, now)
++	require.NoError(t, err)
++	assert.Empty(t, removed)
++}
++
++func TestPruneRetiredSigningKeysWithoutSet(t *testing.T) {
++	db, envConfig, instanceID := newSetTestEnv(t)
++
++	// Pruning before the first startup must be a no-op rather than an error
++	removed, err := PruneRetiredSigningKeys(t.Context(), db, envConfig, instanceID, time.Now())
++	require.NoError(t, err)
++	assert.Empty(t, removed)
++}
++
++func TestReEncryptSigningKeySet(t *testing.T) {
++	db, envConfig, instanceID := newSetTestEnv(t)
++
++	_, err := EnsureSigningKeySet(t.Context(), db, envConfig, instanceID, time.Now())
++	require.NoError(t, err)
++	_, err = RotateSigningKeys(t.Context(), db, envConfig, instanceID, "ES256", "", 2*time.Hour, time.Now())
++	require.NoError(t, err)
++
++	oldKek, err := LoadKeyEncryptionKey(envConfig, instanceID)
++	require.NoError(t, err)
++	newMaster := []byte("different-encryption-key-32-chars")
++	newKek, err := LoadKeyEncryptionKey(&common.EnvConfigSchema{EncryptionKey: newMaster}, instanceID)
++	require.NoError(t, err)
++
++	require.NoError(t, ReEncryptSigningKeySet(t.Context(), db, oldKek, newKek))
++
++	// Every generation is readable with the new KEK, and active kid plus deadlines survive re-wrapping
++	loaded, err := LoadSigningKeySet(t.Context(), db, &common.EnvConfigSchema{EncryptionKey: newMaster}, instanceID)
++	require.NoError(t, err)
++	assert.Len(t, loaded.Set.Generations, 2)
++	_, gen := loaded.ActiveKey()
++	assert.Equal(t, "ES256", gen.Alg)
++
++	// The old KEK must no longer be able to decrypt the generations
++	_, err = LoadSigningKeySet(t.Context(), db, envConfig, instanceID)
++	require.Error(t, err, "Ciphertext re-wrapped with the new KEK must fail to decrypt with the old KEK")
++}
++
++func TestSigningKeySetValidate(t *testing.T) {
++	now := time.Now()
++	past := now.Add(-time.Hour)
++
++	tests := []struct {
++		name string
++		set  *SigningKeySet
++	}{
++		{name: "zero version", set: &SigningKeySet{Version: 0, ActiveKid: "a", Generations: []SigningKeyGeneration{{Kid: "a", EncryptedJWK: "x"}}}},
++		{name: "empty active kid", set: &SigningKeySet{Version: 1, ActiveKid: "", Generations: []SigningKeyGeneration{{Kid: "a", EncryptedJWK: "x"}}}},
++		{name: "no active generation", set: &SigningKeySet{Version: 1, ActiveKid: "a", Generations: []SigningKeyGeneration{{Kid: "a", EncryptedJWK: "x", RetiredAt: &past}}}},
++		{name: "two active generations", set: &SigningKeySet{Version: 1, ActiveKid: "a", Generations: []SigningKeyGeneration{{Kid: "a", EncryptedJWK: "x"}, {Kid: "b", EncryptedJWK: "y"}}}},
++		{name: "active kid unknown", set: &SigningKeySet{Version: 1, ActiveKid: "c", Generations: []SigningKeyGeneration{{Kid: "a", EncryptedJWK: "x"}}}},
++		{name: "duplicate kids", set: &SigningKeySet{Version: 1, ActiveKid: "a", Generations: []SigningKeyGeneration{{Kid: "a", EncryptedJWK: "x"}, {Kid: "a", EncryptedJWK: "y", RetiredAt: &past}}}},
++		{name: "missing key material", set: &SigningKeySet{Version: 1, ActiveKid: "a", Generations: []SigningKeyGeneration{{Kid: "a"}}}},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			require.ErrorIs(t, tt.set.Validate(), ErrSigningKeySetInvalid)
++		})
++	}
++
++	// The valid shape passes
++	valid := &SigningKeySet{
++		Version:   1,
++		ActiveKid: "a",
++		Generations: []SigningKeyGeneration{
++			{Kid: "a", EncryptedJWK: "x"},
++			{Kid: "b", EncryptedJWK: "y", RetiredAt: &past, RetainUntil: &now},
++		},
++	}
++	require.NoError(t, valid.Validate())
++
++	// Default retention must cover the maximum OIDC token lifetime
++	assert.Equal(t, time.Duration(model.MaxTokenDurationMinutes)*time.Minute, DefaultRetiredSigningKeyRetention())
++}
++
++type seedGenerationSpec struct {
++	kid     string
++	alg     string
++	active  bool
++	retired bool
++	expired bool
++}
++
++// buildSeedSet constructs a valid persistent set directly, so tests can place generations at arbitrary deadlines
++func buildSeedSet(t *testing.T, store *SigningKeySetStore, specs []seedGenerationSpec) *SigningKeySet {
++	t.Helper()
++
++	now := time.Now()
++	set := &SigningKeySet{Version: signingKeySetVersion}
++	for _, spec := range specs {
++		key, err := GenerateKey(spec.alg, crvForAlg(spec.alg))
++		require.NoError(t, err)
++		if spec.kid != "" {
++			require.NoError(t, key.Set(jwxjwk.KeyIDKey, spec.kid))
++		}
++		encrypted, err := store.EncryptKey(key)
++		require.NoError(t, err)
++		kid, _ := key.KeyID()
++
++		gen := SigningKeyGeneration{
++			Kid:          kid,
++			Alg:          spec.alg,
++			EncryptedJWK: encrypted,
++			CreatedAt:    now.Add(-2 * time.Hour),
++		}
++		if spec.retired || spec.expired {
++			retiredAt := now.Add(-time.Hour)
++			gen.RetiredAt = &retiredAt
++			if spec.expired {
++				retainUntil := now.Add(-time.Minute)
++				gen.RetainUntil = &retainUntil
++			} else {
++				retainUntil := now.Add(time.Hour)
++				gen.RetainUntil = &retainUntil
++			}
++		}
++		if spec.active {
++			set.ActiveKid = kid
++		}
++		set.Generations = append(set.Generations, gen)
++	}
++	require.NotEmpty(t, set.ActiveKid, "Seed set must designate an active generation")
++	return set
++}
++
++func crvForAlg(alg string) string {
++	if alg == "EdDSA" {
++		return "Ed25519"
++	}
++	return ""
++}

@@ -64,7 +64,12 @@ func newProvider(store *Store, authenticator *federatedClientAuthenticator, sign
 	keyGetter := func(context.Context) (interface{}, error) {
 		return SigningKeyFromSigner(signer)
 	}
-	sig := newJWTSigner(keyGetter)
+	// Resolve verification keys by kid so retired generations still validate tokens after rotation
+	var resolveVerificationKey func(kid string) (any, bool)
+	if resolver, ok := signer.(VerificationKeyResolver); ok {
+		resolveVerificationKey = resolver.GetVerificationKey
+	}
+	sig := newJWTSigner(keyGetter, resolveVerificationKey)
 	deviceStrategy := &deviceStrategy{DefaultDeviceStrategy: compose.NewDeviceStrategy(fositeConfig)}
 	rfc9068AccessTokenStrategy := &fositeoauth2.RFC9068JWTStrategy{
 		DefaultJWTStrategy: &fositeoauth2.DefaultJWTStrategy{

@@ -9,6 +9,7 @@ import (
 
 	francishost "github.com/italypaleale/francis/host"
 	"github.com/lestrrat-go/jwx/v4/jwa"
+	"github.com/lestrrat-go/jwx/v4/jwk"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"gorm.io/gorm"
 
@@ -28,6 +29,17 @@ type TokenSigner interface {
 	GetPrivateKey() any
 	GetKeyAlg() (jwa.KeyAlgorithm, error)
 	GetKeyID() (string, bool)
+}
+
+// VerificationKeyResolver is implemented by signers that can verify tokens by kid against multiple key generations
+// Tokens signed by a retired generation must keep verifying for as long as the key stays in the JWKS
+type VerificationKeyResolver interface {
+	GetVerificationKey(kid string) (any, bool)
+}
+
+// KeySetResolver is implemented by signers that expose every public key a token may be verified against, including retired generations
+type KeySetResolver interface {
+	GetVerificationKeySet() (jwk.Set, error)
 }
 
 type CustomClaimSource interface {

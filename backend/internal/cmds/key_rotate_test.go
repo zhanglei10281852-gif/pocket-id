@@ -2,6 +2,7 @@ package cmds
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -63,6 +64,16 @@ func TestKeyRotate(t *testing.T) {
 			wantErr: true,
 			errMsg:  "key algorithm is required",
 		},
+		{
+			name: "negative retention",
+			flags: keyRotateFlags{
+				Alg:           "RS256",
+				RetentionDays: -1,
+				Yes:           true,
+			},
+			wantErr: true,
+			errMsg:  "retention days must be a positive number",
+		},
 	}
 
 	for _, tt := range tests {
@@ -73,20 +84,12 @@ func TestKeyRotate(t *testing.T) {
 }
 
 func testKeyRotateWithDatabaseStorage(t *testing.T, flags keyRotateFlags, wantErr bool, errMsg string) {
-	// Set up database storage config
 	envConfig := &common.EnvConfigSchema{
 		EncryptionKey: []byte("test-encryption-key-characters-long"),
 	}
 
-	// Create test database
 	db := testingutils.NewDatabaseForTest(t)
-
-	// Load the instance ID
 	instanceID, err := instanceid.Load(t.Context(), db)
-	require.NoError(t, err)
-
-	// Get key provider
-	keyProvider, err := jwkutils.GetKeyProvider(db, envConfig, instanceID)
 	require.NoError(t, err)
 
 	// Run the key rotation
@@ -99,21 +102,21 @@ func testKeyRotateWithDatabaseStorage(t *testing.T, flags keyRotateFlags, wantEr
 		}
 		return
 	}
-
 	require.NoError(t, err)
 
-	// Verify key was created
-	key, err := keyProvider.LoadKey(t.Context())
+	// The new key must be the active generation of the persistent set
+	loaded, err := jwkutils.LoadSigningKeySet(t.Context(), db, envConfig, instanceID)
 	require.NoError(t, err)
+	key, gen := loaded.ActiveKey()
 	require.NotNil(t, key)
+	require.NotNil(t, gen)
+	assert.Nil(t, gen.RetiredAt, "Rotated-to generation must be active")
 
-	// Verify the algorithm matches what we requested
 	alg, _ := key.Algorithm()
 	assert.NotEmpty(t, alg)
 	if flags.Alg != "" {
 		expectedAlg := flags.Alg
 		if expectedAlg == "EdDSA" {
-			// EdDSA keys should have the EdDSA algorithm
 			assert.Equal(t, "EdDSA", alg.String())
 		} else {
 			assert.Equal(t, expectedAlg, alg.String())
@@ -127,17 +130,17 @@ func TestKeyRotateSessionKey(t *testing.T) {
 	}
 
 	db := testingutils.NewDatabaseForTest(t)
-
 	instanceID, err := instanceid.Load(t.Context(), db)
 	require.NoError(t, err)
 
 	// Seed both keys so we can check that only the session key is replaced
-	keyProvider, err := jwkutils.GetKeyProvider(db, envConfig, instanceID)
-	require.NoError(t, err)
 	signingKey, err := jwkutils.GenerateKey("ES256", "")
 	require.NoError(t, err)
-	err = keyProvider.SaveKey(t.Context(), signingKey)
+	signingKeyProvider, err := jwkutils.GetKeyProvider(db, envConfig, instanceID)
 	require.NoError(t, err)
+	err = signingKeyProvider.SaveKey(t.Context(), signingKey)
+	require.NoError(t, err)
+	signingKeyID, _ := signingKey.KeyID()
 
 	sessionKeyProvider, err := jwkutils.GetSessionKeyProvider(db, envConfig, instanceID)
 	require.NoError(t, err)
@@ -163,12 +166,10 @@ func TestKeyRotateSessionKey(t *testing.T) {
 	rotatedKeyID, _ := rotatedSessionKey.KeyID()
 	assert.NotEqual(t, originalKeyID, rotatedKeyID, "Session key should have been replaced")
 
-	// The token signing key must be left untouched
-	unchangedSigningKey, err := keyProvider.LoadKey(t.Context())
+	// The seeded signing key row must be left completely untouched, since only the session key was rotated
+	unchangedSigningKey, err := signingKeyProvider.LoadKey(t.Context())
 	require.NoError(t, err)
 	require.NotNil(t, unchangedSigningKey)
-
-	signingKeyID, _ := signingKey.KeyID()
 	unchangedSigningKeyID, _ := unchangedSigningKey.KeyID()
 	assert.Equal(t, signingKeyID, unchangedSigningKeyID, "Token signing key should not have been rotated")
 }
@@ -179,7 +180,6 @@ func TestKeyRotateDoesNotChangeSessionKey(t *testing.T) {
 	}
 
 	db := testingutils.NewDatabaseForTest(t)
-
 	instanceID, err := instanceid.Load(t.Context(), db)
 	require.NoError(t, err)
 
@@ -220,7 +220,6 @@ func TestKeyRotateMultipleAlgorithms(t *testing.T) {
 
 	for _, algo := range algorithms {
 		t.Run(algo.alg, func(t *testing.T) {
-			// Test with database storage for all algorithms
 			testKeyRotateWithDatabaseStorage(t, keyRotateFlags{
 				Alg: algo.alg,
 				Crv: algo.crv,
@@ -228,4 +227,56 @@ func TestKeyRotateMultipleAlgorithms(t *testing.T) {
 			}, false, "")
 		})
 	}
+}
+
+func TestKeyRotateKeepsPreviousGenerationRetired(t *testing.T) {
+	envConfig := &common.EnvConfigSchema{
+		EncryptionKey: []byte("test-encryption-key-characters-long"),
+	}
+
+	db := testingutils.NewDatabaseForTest(t)
+	instanceID, err := instanceid.Load(t.Context(), db)
+	require.NoError(t, err)
+
+	// First rotation bootstraps the set with RS256
+	err = keyRotate(t.Context(), keyRotateFlags{Alg: "RS256", RetentionDays: 30, Yes: true}, db, instanceID, envConfig)
+	require.NoError(t, err)
+	first, err := jwkutils.LoadSigningKeySet(t.Context(), db, envConfig, instanceID)
+	require.NoError(t, err)
+	_, firstGen := first.ActiveKey()
+	require.NotNil(t, firstGen)
+	firstKid := firstGen.Kid
+
+	// Second rotation switches to ES256 and must retire the first generation atomically
+	err = keyRotate(t.Context(), keyRotateFlags{Alg: "ES256", RetentionDays: 30, Yes: true}, db, instanceID, envConfig)
+	require.NoError(t, err)
+	second, err := jwkutils.LoadSigningKeySet(t.Context(), db, envConfig, instanceID)
+	require.NoError(t, err)
+	require.Len(t, second.Set.Generations, 2)
+
+	_, activeGen := second.ActiveKey()
+	require.NotNil(t, activeGen)
+	assert.NotEqual(t, firstKid, activeGen.Kid)
+	assert.Equal(t, "ES256", activeGen.Alg)
+
+	var retired *jwkutils.SigningKeyGeneration
+	for i := range second.Set.Generations {
+		if second.Set.Generations[i].Kid == firstKid {
+			retired = &second.Set.Generations[i]
+			break
+		}
+	}
+	require.NotNil(t, retired, "First generation must be retained")
+	require.NotNil(t, retired.RetiredAt, "First generation must be marked retired")
+	require.NotNil(t, retired.RetainUntil, "First generation must have a retain-until deadline")
+	assert.WithinDuration(t, retired.RetiredAt.Add(30*24*time.Hour), *retired.RetainUntil, time.Minute, "Retention window must match the requested 30 days")
+
+	// Exactly one active generation must ever exist
+	activeCount := 0
+	for _, gen := range second.Set.Generations {
+		if gen.Active() {
+			activeCount++
+		}
+	}
+	assert.Equal(t, 1, activeCount, "There must be exactly one active generation")
 }
