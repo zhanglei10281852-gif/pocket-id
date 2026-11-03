@@ -2,17 +2,12 @@ package service
 
 import (
 	"archive/zip"
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"log/slog"
-	"slices"
-	"strings"
 
 	"gorm.io/gorm"
 
@@ -26,6 +21,19 @@ type ImportService struct {
 	db      *gorm.DB
 	storage storage.FileStorage
 	actors  ActorsBackupProvider
+
+	// faults injects failures at specific phases and is only set by unit tests
+	faults *importFaults
+}
+
+// importFaults injects a failure into an import execution at a named phase
+type importFaults struct {
+	// failAtPhase makes the execution return failErr right after the given phase was recorded; the normal rollback then runs
+	failAtPhase string
+	failErr     error
+
+	// crashAtPhase simulates the process dying at the phase: the execution aborts without any rollback, leaving the journal pending for another process
+	crashAtPhase string
 }
 
 type DatabaseExport struct {
@@ -37,7 +45,7 @@ type DatabaseExport struct {
 
 // NewImportService creates a new ImportService.
 //
-// actors is used to restore the actor host's data, which is stored outside of the Pocket ID schema - when nil, the actor host's existing data is left untouched.
+// actors is used to restore the actor host's data, which is stored outside of the Pocket ID schema - when nil, archives carrying that data are refused instead of being half-restored.
 func NewImportService(db *gorm.DB, storage storage.FileStorage, actors ActorsBackupProvider) *ImportService {
 	return &ImportService{
 		db:      db,
@@ -46,67 +54,8 @@ func NewImportService(db *gorm.DB, storage storage.FileStorage, actors ActorsBac
 	}
 }
 
-// ImportFromZip performs the full import process from the given ZIP reader.
-func (s *ImportService) ImportFromZip(ctx context.Context, r *zip.Reader) error {
-	dbData, err := processZipDatabaseJson(r.File)
-	if err != nil {
-		return err
-	}
-
-	// The actor host's data is restored first because it's an atomic operation that validates its own preconditions, most importantly that no Pocket ID instance is still running
-	// Restoring it before the Pocket ID schema is dropped means such a failure leaves the existing data untouched
-	err = s.importActorsBackup(ctx, r.File)
-	if err != nil {
-		return err
-	}
-
-	err = s.ImportDatabase(ctx, dbData)
-	if err != nil {
-		return err
-	}
-
-	err = s.importUploads(ctx, r.File)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// importActorsBackup restores the actor host's data (actor state, alarms, and dead-lettered jobs) from the Francis backup stream in the ZIP archive.
-func (s *ImportService) importActorsBackup(ctx context.Context, files []*zip.File) error {
-	if s.actors == nil {
-		return nil
-	}
-
-	var backupFile *zip.File
-	for _, f := range files {
-		if f.Name == ActorsBackupFileName {
-			backupFile = f
-			break
-		}
-	}
-	if backupFile == nil {
-		// Archives exported before Pocket ID included the actor host's data don't have that entry, in which case the existing data is left untouched
-		slog.WarnContext(ctx, "The archive does not contain the actor host's data, which will be left unchanged", slog.String("file", ActorsBackupFileName))
-		return nil
-	}
-
-	rc, err := backupFile.Open()
-	if err != nil {
-		return fmt.Errorf("failed to open %s: %w", ActorsBackupFileName, err)
-	}
-	defer rc.Close()
-
-	err = s.actors.Restore(ctx, rc)
-	if err != nil {
-		return fmt.Errorf("failed to restore the actor host's data: %w", err)
-	}
-
-	return nil
-}
-
 // ImportDatabase only imports the database data from the given DatabaseExport struct.
+// It drops and recreates the Pocket ID schema, so callers that need atomicity across the database, uploads, and actor state must use Import instead.
 func (s *ImportService) ImportDatabase(ctx context.Context, dbData DatabaseExport) error {
 	err := s.resetSchema(ctx, dbData.Version)
 	if err != nil {
@@ -146,53 +95,9 @@ func parseDatabaseJsonStream(f *zip.File) (dbData DatabaseExport, err error) {
 	return dbData, nil
 }
 
-// importUploads imports files from the uploads/ directory in the ZIP archive
-func (s *ImportService) importUploads(ctx context.Context, files []*zip.File) error {
-	const maxFileSize = 50 << 20 // 50 MiB
-	const uploadsPrefix = "uploads/"
-
-	for _, f := range files {
-		if !strings.HasPrefix(f.Name, uploadsPrefix) {
-			continue
-		}
-
-		if f.UncompressedSize64 > maxFileSize {
-			return fmt.Errorf("file %s too large (%d bytes)", f.Name, f.UncompressedSize64)
-		}
-
-		targetPath := strings.TrimPrefix(f.Name, uploadsPrefix)
-		if strings.HasSuffix(f.Name, "/") || targetPath == "" {
-			continue // Skip directories
-		}
-
-		err := s.storage.DeleteAll(ctx, targetPath)
-		if err != nil {
-			return fmt.Errorf("failed to delete existing file %s: %w", targetPath, err)
-		}
-
-		rc, err := f.Open()
-		if err != nil {
-			return err
-		}
-
-		buf, err := io.ReadAll(rc)
-		rc.Close()
-		if err != nil {
-			return fmt.Errorf("read file %s: %w", f.Name, err)
-		}
-
-		err = s.storage.Save(ctx, targetPath, bytes.NewReader(buf))
-		if err != nil {
-			return fmt.Errorf("failed to save file %s: %w", targetPath, err)
-		}
-	}
-
-	return nil
-}
-
 // resetSchema drops the existing Pocket ID schema and migrates it to the target version.
 //
-// It deliberately preserves the actor host's own tables (those with the "francis_" prefix): the actor host owns and migrates them, they are not part of a Pocket ID export, and dropping them here would break the actor host on the next startup.
+// It deliberately preserves the actor host's own tables (those with the "francis_" prefix) and the import journal: the actor host owns and migrates the former, while a journal row must survive every schema replacement to drive recovery.
 func (s *ImportService) resetSchema(ctx context.Context, targetVersion uint) error {
 	sqlDb, err := s.db.DB()
 	if err != nil {
@@ -212,6 +117,21 @@ func (s *ImportService) resetSchema(ctx context.Context, targetVersion uint) err
 		return fmt.Errorf("failed to drop existing schema: %w", err)
 	}
 
+	err = migrateToVersion(ctx, s.db, targetVersion)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// migrateToVersion creates the schema at targetVersion using the embedded migration files
+func migrateToVersion(ctx context.Context, db *gorm.DB, targetVersion uint) error {
+	sqlDb, err := db.DB()
+	if err != nil {
+		return fmt.Errorf("failed to get sql.DB: %w", err)
+	}
+
 	// Re-create the schema by migrating to the target version
 	// The migration files manage their own foreign-key state where needed
 	m, cleanup, err := utils.GetEmbeddedMigrateInstance(ctx, sqlDb)
@@ -220,15 +140,13 @@ func (s *ImportService) resetSchema(ctx context.Context, targetVersion uint) err
 	}
 	defer cleanup()
 
-	err = m.Migrate(targetVersion)
-	if err != nil {
+	if err := m.Migrate(targetVersion); err != nil {
 		return fmt.Errorf("migration failed: %w", err)
 	}
-
 	return nil
 }
 
-// dropPocketIDTablesSQLite drops every Pocket ID table (everything except the actor host's "francis_" tables and SQLite's internal tables) on a single dedicated connection with foreign keys disabled.
+// dropPocketIDTablesSQLite drops every Pocket ID table (everything except the actor host's "francis_" tables, the import journal, and SQLite's internal tables) on a single dedicated connection with foreign keys disabled.
 // foreign_keys is a per-connection pragma, and DROP TABLE with it enabled performs an implicit DELETE that fires foreign-key cascades/triggers and can fail depending on the drop order, so pinning to one connection keeps enforcement off for every drop.
 func dropPocketIDTablesSQLite(ctx context.Context, sqlDb *sql.DB) error {
 	conn, err := sqlDb.Conn(ctx)
@@ -248,7 +166,8 @@ func dropPocketIDTablesSQLite(ctx context.Context, sqlDb *sql.DB) error {
 		FROM sqlite_master
 		WHERE type = 'table'
 			AND name NOT LIKE 'sqlite_%'
-			AND name NOT LIKE 'francis_%'`)
+			AND name NOT LIKE 'francis_%'
+			AND name <> ?`, ImportJournalTableName)
 	if err != nil {
 		return fmt.Errorf("failed to list tables: %w", err)
 	}
@@ -278,7 +197,7 @@ func dropPocketIDTablesSQLite(ctx context.Context, sqlDb *sql.DB) error {
 	return nil
 }
 
-// dropPocketIDTablesPostgres drops every Pocket ID table (everything except the actor host's "francis_" tables)
+// dropPocketIDTablesPostgres drops every Pocket ID table (everything except the actor host's "francis_" tables and the import journal)
 // CASCADE removes dependent objects such as foreign keys.
 func dropPocketIDTablesPostgres(ctx context.Context, sqlDb *sql.DB) error {
 	var tables []string
@@ -286,7 +205,8 @@ func dropPocketIDTablesPostgres(ctx context.Context, sqlDb *sql.DB) error {
 		SELECT tablename
 		FROM pg_tables
 		WHERE schemaname = current_schema()
-			AND tablename NOT LIKE 'francis_%'`)
+			AND tablename NOT LIKE 'francis_%'
+			AND tablename <> $1`, ImportJournalTableName)
 	if err != nil {
 		return fmt.Errorf("failed to list tables: %w", err)
 	}
@@ -325,16 +245,7 @@ func (s *ImportService) insertData(dbData DatabaseExport) error {
 	return s.db.Transaction(func(tx *gorm.DB) error {
 		// Iterate through all tables
 		// Some tables need to be processed in order
-		tables := make([]string, 0, len(dbData.Tables))
-		tables = append(tables, dbData.TableOrder...)
-
-		for t := range dbData.Tables {
-			// Skip tables already present where the order matters, the schema_migrations table, and the actor host's own "francis_" tables in case they were included
-			if slices.Contains(dbData.TableOrder, t) || t == "schema_migrations" || strings.HasPrefix(t, "francis_") {
-				continue
-			}
-			tables = append(tables, t)
-		}
+		tables := orderedImportTables(dbData)
 
 		// Insert rows
 		for _, table := range tables {

@@ -1,0 +1,22 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: "每次导入在破坏现有数据前持久记录归档身份、执行所有权和阶段，重复启动能够识别同一未完成导入而不会静默开启新一代。"
+  - id: 2
+    type: f2p
+    text: "只有数据库、uploads 和嵌入式 Francis 状态全部属于同一归档代时才报告成功并允许实例正常启动，任一资源失败都不会留下被当作成功的混合代。"
+  - id: 3
+    type: f2p
+    text: "actor 状态已恢复后数据库 drop、migration 或数据写入失败时，系统能够恢复原完整代或持久保留可继续或回滚的状态，重启后不会运行新 actor 状态配旧数据库。"
+  - id: 4
+    type: f2p
+    text: "数据库完成后 uploads 删除或保存中途失败时，filesystem、database 和 S3 后端不会丢失旧文件集或暴露新旧混合文件，恢复后能确定提交或回滚。"
+  - id: 5
+    type: f2p
+    text: "独占租约丢失、命令取消或进程退出会终止旧所有者的提交资格，重启恢复能够接管未收敛阶段，迟到的旧调用不能覆盖恢复结果。"
+  - id: 6
+    type: p2p
+    text: "不含 actor 快照的旧归档仍保留现有 actor 状态；standalone Francis 仍拒绝半恢复携带 actor 数据的归档，既有提示和安全边界不回归。"
+  - id: 7
+    type: p2p
+    text: "无故障导入以及 SQLite/PostgreSQL、filesystem/database/S3 的既有成功路径保持可用，完成后不会遗留导入所有权或阻塞后续导入。"

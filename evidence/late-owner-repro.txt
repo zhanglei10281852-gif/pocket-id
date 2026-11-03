@@ -1,0 +1,10 @@
+=== RUN   TestReviewLateOldOwnerOverwritesRecoveredActors
+2026/11/03 21:31:20 WARN Exclusive lease lost during import generation=review-generation
+2026/11/03 21:31:20 INFO Converged interrupted import generation generation=review-generation phase=prepared
+
+2026/11/03 21:31:20 [31;1mF:/swe/098834/project-01/backend/internal/service/import_journal.go:222 [35;1mcontext canceled
+[0m[33m[0.000ms] [34;1m[rows:0][0m UPDATE import_journal SET phase = 'actors_restored', updated_at = '2026-11-03 21:31:20.936' WHERE generation_id = 'review-generation' AND owner_id = 'old-owner'
+2026/11/03 21:31:20 ERROR Interrupted import abandoned because ownership or the exclusive lease was lost generation=review-generation error="failed to update import phase: context canceled"
+--- PASS: TestReviewLateOldOwnerOverwritesRecoveredActors (0.86s)
+PASS
+ok  	github.com/pocket-id/pocket-id/backend/internal/service	1.205s

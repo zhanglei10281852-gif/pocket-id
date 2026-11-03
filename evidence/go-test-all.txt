@@ -1,0 +1,46 @@
+?   	github.com/pocket-id/pocket-id/backend/cmd	[no test files]
+?   	github.com/pocket-id/pocket-id/backend/frontend	[no test files]
+ok  	github.com/pocket-id/pocket-id/backend/internal/api	2.723s
+ok  	github.com/pocket-id/pocket-id/backend/internal/apikey	1.189s
+ok  	github.com/pocket-id/pocket-id/backend/internal/appconfig	4.631s
+ok  	github.com/pocket-id/pocket-id/backend/internal/apperror	0.612s
+ok  	github.com/pocket-id/pocket-id/backend/internal/auditlogs	6.624s
+ok  	github.com/pocket-id/pocket-id/backend/internal/authz	0.448s
+ok  	github.com/pocket-id/pocket-id/backend/internal/backchannellogout	2.695s
+ok  	github.com/pocket-id/pocket-id/backend/internal/bootstrap	2.736s
+ok  	github.com/pocket-id/pocket-id/backend/internal/cmds	2.613s
+ok  	github.com/pocket-id/pocket-id/backend/internal/common	0.439s
+ok  	github.com/pocket-id/pocket-id/backend/internal/controller	1.136s
+ok  	github.com/pocket-id/pocket-id/backend/internal/devicelogin	9.059s
+ok  	github.com/pocket-id/pocket-id/backend/internal/dto	0.220s
+ok  	github.com/pocket-id/pocket-id/backend/internal/email	0.772s
+ok  	github.com/pocket-id/pocket-id/backend/internal/emailverification	1.734s
+ok  	github.com/pocket-id/pocket-id/backend/internal/environment	0.313s
+ok  	github.com/pocket-id/pocket-id/backend/internal/geolite	9.471s
+ok  	github.com/pocket-id/pocket-id/backend/internal/httpserver	0.447s
+ok  	github.com/pocket-id/pocket-id/backend/internal/instanceid	3.416s
+ok  	github.com/pocket-id/pocket-id/backend/internal/iplocation	1.808s
+?   	github.com/pocket-id/pocket-id/backend/internal/job	[no test files]
+ok  	github.com/pocket-id/pocket-id/backend/internal/ldapsync	8.121s
+ok  	github.com/pocket-id/pocket-id/backend/internal/logopreset	0.393s
+ok  	github.com/pocket-id/pocket-id/backend/internal/middleware	0.820s
+?   	github.com/pocket-id/pocket-id/backend/internal/model	[no test files]
+ok  	github.com/pocket-id/pocket-id/backend/internal/model/types	1.010s
+ok  	github.com/pocket-id/pocket-id/backend/internal/oidc	22.700s
+ok  	github.com/pocket-id/pocket-id/backend/internal/onetimeaccess	1.367s
+ok  	github.com/pocket-id/pocket-id/backend/internal/outbound	0.272s
+ok  	github.com/pocket-id/pocket-id/backend/internal/scimsync	6.600s
+ok  	github.com/pocket-id/pocket-id/backend/internal/service	33.622s
+ok  	github.com/pocket-id/pocket-id/backend/internal/storage	0.542s
+?   	github.com/pocket-id/pocket-id/backend/internal/tracing	[no test files]
+ok  	github.com/pocket-id/pocket-id/backend/internal/usersignup	1.793s
+ok  	github.com/pocket-id/pocket-id/backend/internal/utils	0.517s
+?   	github.com/pocket-id/pocket-id/backend/internal/utils/cookie	[no test files]
+ok  	github.com/pocket-id/pocket-id/backend/internal/utils/crypto	0.483s
+ok  	github.com/pocket-id/pocket-id/backend/internal/utils/image	0.231s
+ok  	github.com/pocket-id/pocket-id/backend/internal/utils/jwk	2.244s
+?   	github.com/pocket-id/pocket-id/backend/internal/utils/sqlite	[no test files]
+?   	github.com/pocket-id/pocket-id/backend/internal/utils/systemd	[no test files]
+?   	github.com/pocket-id/pocket-id/backend/internal/utils/testing	[no test files]
+ok  	github.com/pocket-id/pocket-id/backend/internal/webauthn	1.606s
+ok  	github.com/pocket-id/pocket-id/backend/resources	0.389s

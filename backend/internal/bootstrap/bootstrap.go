@@ -18,6 +18,7 @@ import (
 	"github.com/pocket-id/pocket-id/backend/internal/instanceid"
 	"github.com/pocket-id/pocket-id/backend/internal/outbound"
 	"github.com/pocket-id/pocket-id/backend/internal/storage"
+	"github.com/pocket-id/pocket-id/backend/internal/utils"
 )
 
 func Bootstrap(ctx context.Context) error {
@@ -41,10 +42,26 @@ func Bootstrap(ctx context.Context) error {
 		return fmt.Errorf("failed to initialize outbound HTTP clients: %w", err)
 	}
 
-	// Init database
-	db, pg, err := NewDatabase(ctx)
+	// Connect to the database without migrating yet, so an interrupted import can be converged before the schema is upgraded or served
+	db, pg, err := ConnectDatabase(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to initialize database: %w", err)
+	}
+
+	// Converge any import generation a previous process left pending, before migrations and every other component start
+	// Without this gate a half-imported database, upload set, or actor state could be served as a successful instance
+	err = RecoverInterruptedImports(ctx, db, pg)
+	if err != nil {
+		return fmt.Errorf("failed to recover from an interrupted import: %w", err)
+	}
+
+	// Run migrations only after the previous generation is safely in place
+	sqlDb, err := db.DB()
+	if err != nil {
+		return fmt.Errorf("failed to get sql.DB: %w", err)
+	}
+	if err = utils.MigrateDatabase(ctx, sqlDb); err != nil {
+		return fmt.Errorf("failed to run migrations: %w", err)
 	}
 	if pg != nil {
 		defer func() {

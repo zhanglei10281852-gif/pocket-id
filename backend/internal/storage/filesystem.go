@@ -38,6 +38,11 @@ func (s *filesystemStorage) Type() string {
 	return TypeFileSystem
 }
 
+// RootPath returns the absolute path of the storage root
+func (s *filesystemStorage) RootPath() string {
+	return s.absoluteRootPath
+}
+
 func (s *filesystemStorage) Close() error {
 	return s.root.Close()
 }

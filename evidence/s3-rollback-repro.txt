@@ -1,0 +1,4 @@
+=== RUN   TestReviewS3RollbackAfterStagedDeleteFailureLeavesNewLiveObject
+--- PASS: TestReviewS3RollbackAfterStagedDeleteFailureLeavesNewLiveObject (0.42s)
+PASS
+ok  	github.com/pocket-id/pocket-id/backend/internal/storage	0.616s

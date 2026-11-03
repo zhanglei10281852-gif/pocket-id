@@ -13,15 +13,18 @@ import (
 
 // stubActorsBackupProvider stands in for the Francis provider and records what the export and import did with it
 type stubActorsBackupProvider struct {
-	backupData []byte
-	backupErr  error
+	backupData  []byte
+	backupErr   error
+	backupCalls int
 
-	restored     []byte
-	restoreCalls int
-	restoreErr   error
+	restored        []byte
+	restoredPayload [][]byte
+	restoreCalls    int
+	restoreErr      error
 }
 
 func (s *stubActorsBackupProvider) Backup(_ context.Context, w io.Writer) error {
+	s.backupCalls++
 	if s.backupErr != nil {
 		return s.backupErr
 	}
@@ -34,9 +37,13 @@ func (s *stubActorsBackupProvider) Restore(_ context.Context, r io.Reader) error
 	if s.restoreErr != nil {
 		return s.restoreErr
 	}
-	var err error
-	s.restored, err = io.ReadAll(r)
-	return err
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	s.restored = data
+	s.restoredPayload = append(s.restoredPayload, data)
+	return nil
 }
 
 func TestExportActorsBackup(t *testing.T) {
@@ -65,6 +72,13 @@ func TestExportActorsBackup(t *testing.T) {
 }
 
 func TestImportActorsBackup(t *testing.T) {
+	// Archives created before Pocket ID exported the actor host's data have no francis.bin entry, so the orchestration leaves the existing actor data untouched
+	t.Run("archives without actor data are detected", func(t *testing.T) {
+		files := readZip(t, buildZip(t, map[string][]byte{"database.json": []byte("{}")}))
+
+		require.Nil(t, zipFileNamed(files, ActorsBackupFileName))
+	})
+
 	t.Run("restores the actor host's data from the archive", func(t *testing.T) {
 		actors := &stubActorsBackupProvider{}
 		files := readZip(t, buildZip(t, map[string][]byte{
@@ -72,29 +86,20 @@ func TestImportActorsBackup(t *testing.T) {
 			ActorsBackupFileName: []byte("francis-backup-payload"),
 		}))
 
-		err := NewImportService(nil, nil, actors).importActorsBackup(t.Context(), files)
+		entry := zipFileNamed(files, ActorsBackupFileName)
+		require.NotNil(t, entry)
+		err := restoreActorsEntry(t.Context(), actors, entry)
 
 		require.NoError(t, err)
 		require.Equal(t, 1, actors.restoreCalls)
 		require.Equal(t, []byte("francis-backup-payload"), actors.restored)
 	})
 
-	// Archives created before Pocket ID exported the actor host's data must still import, leaving the existing actor data alone rather than wiping it
-	t.Run("leaves the actor host's data alone when the archive has none", func(t *testing.T) {
-		actors := &stubActorsBackupProvider{}
-		files := readZip(t, buildZip(t, map[string][]byte{"database.json": []byte("{}")}))
-
-		err := NewImportService(nil, nil, actors).importActorsBackup(t.Context(), files)
-
-		require.NoError(t, err)
-		require.Zero(t, actors.restoreCalls)
-	})
-
 	t.Run("surfaces restore errors", func(t *testing.T) {
 		actors := &stubActorsBackupProvider{restoreErr: errors.New("a host is still connected")}
 		files := readZip(t, buildZip(t, map[string][]byte{ActorsBackupFileName: []byte("francis-backup-payload")}))
 
-		err := NewImportService(nil, nil, actors).importActorsBackup(t.Context(), files)
+		err := restoreActorsEntry(t.Context(), actors, zipFileNamed(files, ActorsBackupFileName))
 
 		require.ErrorContains(t, err, "a host is still connected")
 	})

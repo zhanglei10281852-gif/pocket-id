@@ -3,28 +3,29 @@ package cmds
 import (
 	"archive/zip"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
-	"time"
+	"strings"
 
-	"github.com/italypaleale/francis/clusteradmin"
-	"github.com/italypaleale/francis/components"
 	"github.com/spf13/cobra"
+	"uuid"
 
 	"github.com/pocket-id/pocket-id/backend/internal/bootstrap"
 	"github.com/pocket-id/pocket-id/backend/internal/common"
 	"github.com/pocket-id/pocket-id/backend/internal/service"
+	"github.com/pocket-id/pocket-id/backend/internal/storage"
 	"github.com/pocket-id/pocket-id/backend/internal/utils"
 )
 
 type importFlags struct {
 	Path                  string
+	PathSet               bool
 	Yes                   bool
 	ForcefullyAcquireLock bool
+	Resume                bool
 }
 
 func init() {
@@ -34,6 +35,7 @@ func init() {
 		Use:   "import",
 		Short: "Imports all data of Pocket ID from a ZIP file",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			flags.PathSet = cmd.Flags().Changed("path")
 			return runImport(cmd.Context(), flags)
 		},
 	}
@@ -41,6 +43,7 @@ func init() {
 	importCmd.Flags().StringVarP(&flags.Path, "path", "p", "pocket-id-export.zip", "Path to the ZIP file to import the data from, or '-' to read from stdin")
 	importCmd.Flags().BoolVarP(&flags.Yes, "yes", "y", false, "Skip confirmation prompts")
 	importCmd.Flags().BoolVarP(&flags.ForcefullyAcquireLock, "forcefully-acquire-lock", "", false, "Forcefully acquire exclusive access by terminating any running Pocket ID instance")
+	importCmd.Flags().BoolVar(&flags.Resume, "resume", false, "Continue an interrupted import instead of starting a new one; reuses the staged archive unless --path is given")
 
 	rootCmd.AddCommand(importCmd)
 }
@@ -57,28 +60,65 @@ func runImport(ctx context.Context, flags importFlags) error {
 		)
 	}
 
-	if !flags.Yes {
-		ok, err := askForConfirmation()
+	// Connect to the database without running migrations: the import re-creates the Pocket ID schema itself
+	db, pg, err := bootstrap.ConnectDatabase(ctx)
+	if err != nil {
+		return err
+	}
+
+	if err := service.EnsureImportJournalTable(ctx, db); err != nil {
+		return err
+	}
+
+	// Determine which generation this execution belongs to before opening the archive
+	// A resume reuses the pending generation; a new import gets fresh identity here so the archive can be staged under its work directory
+	var (
+		generationID, token string
+		resumeJournal       *service.ImportJournal
+	)
+	if flags.Resume {
+		resumeJournal, err = service.GetLatestPendingImportJournal(ctx, db)
 		if err != nil {
-			return fmt.Errorf("failed to get confirmation: %w", err)
+			return err
 		}
-		if !ok {
-			fmt.Println("Aborted")
-			os.Exit(1)
+		if resumeJournal == nil {
+			return service.ErrNoImportToResume
+		}
+		generationID = resumeJournal.GenerationID
+		token = resumeJournal.Token
+		slog.Warn("Resuming interrupted import", slog.String("generation", generationID), slog.String("phase", resumeJournal.Phase))
+	} else {
+		generationID = uuid.NewV4().String()
+		token = strings.ReplaceAll(uuid.NewV4().String(), "-", "")[:12]
+	}
+
+	// Resolve the work directory from configuration so the archive can be located before storage is initialized
+	workDir := storage.StagingWorkDirPath(common.EnvConfig.FileBackend, common.EnvConfig.UploadPath, token)
+
+	// Resolve where the archive is read from, defaulting to the staged archive copy when resuming
+	archivePath := flags.Path
+	if flags.Resume && !flags.PathSet {
+		archivePath = filepath.Join(workDir, "archive.zip")
+		if _, err := os.Stat(archivePath); err != nil {
+			return fmt.Errorf("the staged archive of the interrupted import is gone (%s); rerun with --path pointing at the original ZIP: %w", archivePath, err)
+		}
+	}
+
+	if !flags.Yes && !flags.Resume {
+		if err := askForImportConfirmation(); err != nil {
+			return err
 		}
 	}
 
 	var (
 		zipReader *zip.ReadCloser
 		cleanup   func()
-		err       error
 	)
-
-	if flags.Path == "-" {
+	if archivePath == "-" {
 		zipReader, cleanup, err = readZipFromStdin()
 		defer cleanup()
 	} else {
-		zipReader, err = zip.OpenReader(flags.Path)
+		zipReader, err = zip.OpenReader(archivePath)
 	}
 	if err != nil {
 		return fmt.Errorf("failed to open zip: %w", err)
@@ -86,38 +126,35 @@ func runImport(ctx context.Context, flags importFlags) error {
 	defer zipReader.Close()
 
 	// An archive carrying the actor data was taken from a deployment with an embedded runtime, and there is nowhere to put that data here
-	// Restoring only the Pocket ID half of it would leave the runtime holding actor state from a different deployment, so refuse rather than half-restore
+	// Restoring only the Pocket ID half of it would leave the runtime holding actor state from a different deployment, so refuse rather than half-restore, before storage or the lease are touched
 	if !embeddedRuntime {
-		err = ensureNoActorsBackup(&zipReader.Reader)
-		if err != nil {
+		if err := ensureNoActorsBackup(&zipReader.Reader); err != nil {
 			return err
 		}
 	}
 
-	// Connect to the database without running migrations: the import re-creates the Pocket ID schema itself
-	db, pg, err := bootstrap.ConnectDatabase(ctx)
+	// Init the storage provider only once the archive is known to fit this topology
+	fileStorage, err := bootstrap.InitStorage(ctx, db)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to initialize storage: %w", err)
 	}
+	defer func() {
+		_ = fileStorage.Close()
+	}()
 
 	importCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	// Take exclusive access to the cluster so no Pocket ID replica is running while we overwrite the database
 	// The lease lives in the actor host's own tables, so it only exists when the runtime is embedded: with a standalone runtime the operator was told to stop the replicas instead
-	var providerOpts components.ProviderOptions
+	var leaseLost <-chan struct{}
 	if embeddedRuntime {
-		// The cluster admin talks to the same database as the actor host, so build its provider options the same way the host does
-		providerOpts, err = bootstrap.ActorsProviderOptions(db, pg)
-		if err != nil {
-			return err
-		}
-
-		release, lost, err := acquireExclusiveAccess(ctx, providerOpts, flags.ForcefullyAcquireLock)
+		release, lost, err := bootstrap.AcquireExclusiveAccess(ctx, db, pg, flags.ForcefullyAcquireLock)
 		if err != nil {
 			return err
 		}
 		defer release()
+		leaseLost = lost
 
 		// Abort the import if exclusive access is lost partway through (for example if the lease can no longer be renewed)
 		go func() {
@@ -129,21 +166,14 @@ func runImport(ctx context.Context, flags importFlags) error {
 		}()
 	}
 
-	// Init the storage provider
-	storage, err := bootstrap.InitStorage(importCtx, db)
-	if err != nil {
-		return fmt.Errorf("failed to initialize storage: %w", err)
-	}
-
-	// Close filesystem storage handles before the command exits
-	defer func() {
-		_ = storage.Close()
-	}()
-
-	// The actor data lives outside of the Pocket ID schema, so it's restored through Francis
+	// The actor data lives outside of the Pocket ID schema, so it is restored through Francis
 	// Restoring requires exclusive access to the cluster, which was acquired above, and the import service skips the actor data entirely when no provider is passed
 	var actorsProvider service.ActorsBackupProvider
 	if embeddedRuntime {
+		providerOpts, err := bootstrap.ActorsProviderOptions(db, pg)
+		if err != nil {
+			return err
+		}
 		provider, err := bootstrap.NewActorsBackupProvider(importCtx, providerOpts)
 		if err != nil {
 			return fmt.Errorf("failed to initialize the actor host's data provider: %w", err)
@@ -155,11 +185,24 @@ func runImport(ctx context.Context, flags importFlags) error {
 		actorsProvider = provider
 	}
 
-	// Create the import service
-	importService := service.NewImportService(db, storage, actorsProvider)
+	// Stage a copy of the archive so a crashed import can be continued with --resume
+	// Rollback does not depend on this copy, so a staging failure only disables resume and does not abort the import
+	stagedPath := filepath.Join(workDir, "archive.zip")
+	if !flags.Resume {
+		if err := stageArchiveCopy(&zipReader.Reader, archivePath, stagedPath); err != nil {
+			slog.Warn("Failed to stage a copy of the archive; --resume will not be available after a crash, but rollback still will", slog.Any("error", err))
+		}
+	}
 
-	// Load from ZIP
-	err = importService.ImportFromZip(importCtx, &zipReader.Reader)
+	importService := service.NewImportService(db, fileStorage, actorsProvider)
+
+	err = importService.Import(importCtx, &zipReader.Reader, service.ImportOptions{
+		Resume:       flags.Resume,
+		GenerationID: generationID,
+		Token:        token,
+		WorkDir:      workDir,
+		LeaseLost:    leaseLost,
+	})
 	if err != nil {
 		return fmt.Errorf("failed to import data from zip: %w", err)
 	}
@@ -168,49 +211,44 @@ func runImport(ctx context.Context, flags importFlags) error {
 	return nil
 }
 
-// acquireExclusiveAccess takes an exclusive-access lease on the cluster so the import can safely overwrite the database.
-//
-// It returns a release function that must be called once the import is done, and a channel that is closed if the lease is lost while it is held.
-func acquireExclusiveAccess(ctx context.Context, providerOpts components.ProviderOptions, force bool) (release func(), lost <-chan struct{}, err error) {
-	// New initializes the provider, applying the actor host's schema migrations, so this also works against a brand-new (empty) database
-	admin, err := clusteradmin.New(ctx, providerOpts, clusteradmin.Options{
-		// Match the actor host so the admin waits the right amount of time for hosts to drain
-		HostHealthCheckDeadline: bootstrap.ActorsHostHealthCheckDeadline(common.EnvConfig.HAEnabled),
-		Logger:                  slog.Default(),
-	})
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create cluster admin: %w", err)
+// stageArchiveCopy places a private copy of the archive in the generation work directory
+// Stdin archives were already copied to a temporary file by the ZIP reader, so both source kinds are handled as files
+func stageArchiveCopy(zr *zip.Reader, sourcePath, stagedPath string) error {
+	if sourcePath == "-" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(stagedPath), 0700); err != nil {
+		return fmt.Errorf("failed to create work directory: %w", err)
 	}
 
-	lost, err = admin.AcquireExclusive(ctx, clusteradmin.AcquireOptions{Force: force})
+	src, err := os.Open(sourcePath)
 	if err != nil {
-		_ = admin.Close()
-		switch {
-		case errors.Is(err, components.ErrHostsConnected):
-			//nolint:staticcheck
-			return nil, nil, errors.New("Pocket ID must be stopped before importing data - please stop the running instance or run with --forcefully-acquire-lock to terminate the other instance")
-		case errors.Is(err, components.ErrExclusiveHeld):
-			return nil, nil, errors.New("another exclusive operation, such as another import, is already in progress; please wait for it to complete and try again")
-		default:
-			return nil, nil, fmt.Errorf("failed to acquire exclusive access: %w", err)
-		}
+		return fmt.Errorf("failed to open archive for staging: %w", err)
 	}
+	defer src.Close()
 
-	release = func() {
-		// The import preserves the actor host's "francis_" tables, including the lease row, so the lease must be released explicitly
-		// Detach from ctx so the release still runs even if the import was canceled
-		releaseCtx, cancelRelease := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-		defer cancelRelease()
-		rErr := admin.ReleaseExclusive(releaseCtx)
-		if rErr != nil {
-			slog.WarnContext(ctx, "Failed to release exclusive access", slog.Any("error", rErr))
-		}
-		_ = admin.Close()
+	tmp := stagedPath + ".tmp"
+	dst, err := os.Create(tmp)
+	if err != nil {
+		return fmt.Errorf("failed to create staged archive: %w", err)
 	}
-	return release, lost, nil
+	if _, err := io.Copy(dst, src); err != nil {
+		dst.Close()
+		_ = os.Remove(tmp)
+		return fmt.Errorf("failed to copy archive into the work directory: %w", err)
+	}
+	if err := dst.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, stagedPath); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
-func askForConfirmation() (bool, error) {
+func askForImportConfirmation() error {
 	fmt.Println("WARNING: This feature is experimental and may not work correctly. Please create a backup before proceeding and report any issues you encounter.")
 	fmt.Println()
 	fmt.Println("WARNING: Import will erase all existing data at the following locations:")
@@ -219,10 +257,13 @@ func askForConfirmation() (bool, error) {
 
 	ok, err := utils.PromptForConfirmation("Do you want to continue?")
 	if err != nil {
-		return false, err
+		return fmt.Errorf("failed to get confirmation: %w", err)
 	}
-
-	return ok, nil
+	if !ok {
+		fmt.Println("Aborted")
+		os.Exit(1)
+	}
+	return nil
 }
 
 // absolutePathOrOriginal returns the absolute path of the given path, or the original if it fails
@@ -234,6 +275,7 @@ func absolutePathOrOriginal(path string) string {
 	return abs
 }
 
+// readZipFromStdin copies stdin to a temporary file and opens it as a ZIP reader
 func readZipFromStdin() (*zip.ReadCloser, func(), error) {
 	tmpFile, err := os.CreateTemp("", "pocket-id-import-*.zip")
 	if err != nil {

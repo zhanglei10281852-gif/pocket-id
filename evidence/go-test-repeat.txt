@@ -1,0 +1,2 @@
+ok  	github.com/pocket-id/pocket-id/backend/internal/service	84.956s
+ok  	github.com/pocket-id/pocket-id/backend/internal/storage	0.697s

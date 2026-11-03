@@ -100,8 +100,8 @@ func extractDatabaseTx(tx *gorm.DB) (DatabaseExport, error) {
 	}
 
 	for table := range schema {
-		// Skip internal tables and the actor host's own "francis_" tables
-		if table == "storage" || table == "schema_migrations" || strings.HasPrefix(table, "francis_") {
+		// Skip internal tables, the import journal, and the actor host's own "francis_" tables
+		if table == "storage" || table == "schema_migrations" || table == ImportJournalTableName || strings.HasPrefix(table, "francis_") {
 			continue
 		}
 		err = dumpTable(tx, table, schema[table], &out)

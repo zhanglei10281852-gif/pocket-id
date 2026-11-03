@@ -1,0 +1,18 @@
+项目：pocket-id-pocket-id-113f1f34-2be5-46b6-9167-e4354d9003d1
+基线：80a504b454f273efea6b692857f1ceb6a34b2e7f
+有效轮数：159；Harness：Trae；证据源：count-trae-cn-steps.py；范围：latest_turn。
+Session：2026-11-03T10:19:02.048Z 至 2026-11-03T12:14:23.098Z，共 6921 秒，exceededTwoHours=否。
+
+无缓存验证：
+- go test -count=1 -tags=exclude_frontend,unit ./...：通过。
+- go vet -tags=exclude_frontend,unit ./...：通过。
+- go test -count=3 -tags=exclude_frontend,unit ./internal/service ./internal/storage：三轮通过。
+
+受控失败交错：
+- TestReviewLateOldOwnerOverwritesRecoveredActors：通过。测试阻塞旧 actor Restore，关闭 LeaseLost，RecoverPending 回滚并返回后再解除阻塞；旧 Restore 最终把 actor 从 old-actors 覆盖为 new-actors。
+- TestReviewS3RollbackAfterStagedDeleteFailureLeavesNewLiveObject：通过。测试让 S3 CopyObject 已写入 live、DeleteObject staging 失败；Rollback 返回成功后 live 仍为 new-logo，旧 backup 随 cleanup 删除。
+
+真实后端覆盖：
+- 本机 127.0.0.1:5432 TcpTestSucceeded=False。
+- Docker Desktop Linux Engine named pipe 不存在。
+- 未取得 PostgreSQL 互导或 S3 无故障整链路的真实服务验证。

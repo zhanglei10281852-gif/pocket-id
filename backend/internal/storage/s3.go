@@ -141,8 +141,13 @@ func (s *s3Storage) List(ctx context.Context, path string) ([]ObjectInfo, error)
 			if obj.Key == nil {
 				continue
 			}
+			path := s.pathFromKey(aws.ToString(obj.Key))
+			// Hide the import staging/backup namespaces so exports and cleanup jobs never see an in-progress import
+			if IsReservedImportPath(path) {
+				continue
+			}
 			objects = append(objects, ObjectInfo{
-				Path:    s.pathFromKey(aws.ToString(obj.Key)),
+				Path:    path,
 				Size:    aws.ToInt64(obj.Size),
 				ModTime: aws.ToTime(obj.LastModified),
 			})
