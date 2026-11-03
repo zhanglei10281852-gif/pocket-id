@@ -1,2 +1,1 @@
-go vet -tags=exclude_frontend,unit ./...
-PASS: exit code 0; no diagnostics emitted.
+pattern ./...: directory prefix . does not contain main module or its selected dependencies
